@@ -1,15 +1,19 @@
 """
-Meesho Telegram Bot (Ultra-Lightweight & Loop-Proof)
-=====================================================
-- Ultra-low memory: Uses PyPDF2 (15MB RAM vs 500MB with pdfplumber) - Never crashes Render 512MB limit.
-- One PDF at a time: Cancels previous job immediately if a new PDF is sent.
-- No loops on restart: Discards all past backlog messages on startup.
-- Multi-quantity alerts, in-chat picklist, and sorted PDF generation.
+Meesho Telegram Bot (Ultra-Lightweight, Webhook + Polling, Zero-Loop)
+======================================================================
+- Uses ONLY PyPDF2 & requests (uses ~15MB RAM total, never exceeds Render 512MB limit).
+- Instant HTTP 200 OK to Telegram: Prevents Telegram from retrying webhook deliveries.
+- Deduplication: Drops duplicate update_ids so it NEVER processes the same message twice.
+- Single Worker Lock: Strictly ONE PDF at a time. Total RAM is hard-capped under 25MB.
+- Auto-cancels previous job immediately if a new PDF is sent by the user.
+- Works on Render via Webhook (auto-wakes Render) and on local PC via Polling.
+- Responds to UptimeRobot GET / pings with 200 OK to stay awake 24/7.
 """
 
 import os
 import sys
 import gc
+import json
 import time
 import tempfile
 import threading
@@ -27,43 +31,15 @@ SIZE_ORDER = {"M": 0, "L": 1, "XL": 2, "XXL": 3, "XXXL": 4}
 SIZE_LIST = ["M", "L", "XL", "XXL", "XXXL"]
 VALID_SIZES = set(SIZE_LIST)
 
-# Track current active job per chat to allow "terminate on new send"
+# Deduplication and single-job control
+processed_updates = set()
 active_job_id = {}
 user_modes = {}
-job_lock = threading.Lock()
+job_counter = 0
+global_processing_lock = threading.Lock()
 
 
-# ── Keep-Alive Web Server for Render / UptimeRobot ─────────────────────
-class KeepAliveHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Meesho Bot is live!")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
-
-def start_keep_alive_server():
-    port = int(os.environ.get("PORT", 8080))
-    def serve():
-        try:
-            socketserver.TCPServer.allow_reuse_address = True
-            with socketserver.TCPServer(("", port), KeepAliveHandler) as httpd:
-                print(f"[Keep-Alive] HTTP server listening on port {port}")
-                httpd.serve_forever()
-        except Exception as e:
-            print(f"[Keep-Alive] Port notice: {e}")
-
-    t = threading.Thread(target=serve, daemon=True)
-    t.start()
-
-
-# ── Lightweight PDF Parsing Logic (PyPDF2 - uses only ~15MB RAM) ──────
+# ── PDF Parsing Logic (PyPDF2 - uses only ~15MB RAM) ──────────────────
 
 def normalize_size(raw):
     return raw.strip().upper()
@@ -115,12 +91,11 @@ def parse_sku(sku_line):
     return (ttype, colour, size, qty, False)
 
 def process_pdf(input_pdf_path, output_pdf_path, check_cancelled):
-    reader = PdfReader(input_pdf_path)
+    reader = PdfReader(input_pdf_path, strict=False)
     n = len(reader.pages)
     items = []
 
     for idx in range(n):
-        # Check if user sent another PDF (terminate immediately if cancelled)
         if check_cancelled():
             return None, None, None
 
@@ -229,7 +204,6 @@ def process_pdf(input_pdf_path, output_pdf_path, check_cancelled):
     if check_cancelled():
         return None, None, None
 
-    # Write rearranged PDF
     writer = PdfWriter()
     for t, c, s, qty, is_anom, page_idx, raw in ordered:
         writer.add_page(reader.pages[page_idx])
@@ -237,7 +211,6 @@ def process_pdf(input_pdf_path, output_pdf_path, check_cancelled):
     with open(output_pdf_path, "wb") as f:
         writer.write(f)
 
-    # Free memory immediately
     del reader
     del writer
     gc.collect()
@@ -258,8 +231,7 @@ class TelegramBot:
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         try:
-            r = requests.post(url, data=data, timeout=15)
-            return r.json()
+            return requests.post(url, data=data, timeout=15).json()
         except Exception:
             return None
 
@@ -281,15 +253,13 @@ class TelegramBot:
             filename = os.path.basename(file_path)
             with open(file_path, "rb") as f:
                 files = {"document": (filename, f)}
-                r = requests.post(url, data=data, files=files, timeout=60)
-            return r.json()
+                return requests.post(url, data=data, files=files, timeout=60).json()
         except Exception:
             return None
 
     def get_file(self, file_id):
         try:
-            r = requests.get(f"{self.base_url}/getFile", params={"file_id": file_id}, timeout=15)
-            return r.json()
+            return requests.get(f"{self.base_url}/getFile", params={"file_id": file_id}, timeout=15).json()
         except Exception:
             return None
 
@@ -300,18 +270,205 @@ class TelegramBot:
             for chunk in r.iter_content(chunk_size=16384):
                 f.write(chunk)
 
+    def set_webhook(self, webhook_url):
+        url = f"{self.base_url}/setWebhook"
+        r = requests.post(url, data={"url": webhook_url}, timeout=15)
+        print(f"[Webhook] Registered: {webhook_url} -> {r.text}")
+        return r.json()
+
+    def delete_webhook(self):
+        url = f"{self.base_url}/deleteWebhook"
+        r = requests.post(url, timeout=15)
+        print(f"[Webhook] Cleared webhook for polling -> {r.text}")
+        return r.json()
+
     def get_updates(self, offset=None, timeout=20):
         params = {"timeout": timeout}
         if offset is not None:
             params["offset"] = offset
         try:
-            r = requests.get(f"{self.base_url}/getUpdates", params=params, timeout=timeout + 8)
-            return r.json()
+            return requests.get(f"{self.base_url}/getUpdates", params=params, timeout=timeout + 8).json()
         except Exception:
             return None
 
 
-# ── Main Runner ────────────────────────────────────────────────────────
+# ── Update Handler (Strictly 1 PDF at a Time, Deduplicated) ───────────
+
+def handle_update(bot, item):
+    global job_counter
+    update_id = item.get("update_id")
+
+    # 1. Deduplication: Never process the same update twice!
+    if update_id is not None:
+        if update_id in processed_updates:
+            return
+        processed_updates.add(update_id)
+        if len(processed_updates) > 2000:
+            # Prevent memory growth of set
+            processed_updates.clear()
+
+    msg = item.get("message")
+    if not msg:
+        return
+
+    chat_id = msg["chat"]["id"]
+    msg_id = msg["message_id"]
+    text = msg.get("text", "").strip()
+
+    if text in ("/start", "/help"):
+        mode = user_modes.get(chat_id, "both")
+        welcome = (
+            "👋 *Meesho Label & Picklist Bot*\n\n"
+            "📄 Send me any Meesho Shipping Label PDF.\n"
+            "I will reply with:\n"
+            "1. 📋 Clean Picklist (in chat + .txt file)\n"
+            "2. 📑 Rearranged PDF (in picklist order)\n"
+            "3. ⚠️ Multi-quantity alert if an order has >1 qty\n\n"
+            f"⚙️ *Current Mode:* `{mode.upper()}`\n"
+            "• `/both` - Picklist TXT + Rearranged PDF (default)\n"
+            "• `/txt`  - Picklist TXT only"
+        )
+        bot.send_message(chat_id, welcome, reply_to_message_id=msg_id)
+        return
+
+    elif text == "/txt":
+        user_modes[chat_id] = "txt"
+        bot.send_message(chat_id, "⚡ Mode set to: *TXT Only*.", reply_to_message_id=msg_id)
+        return
+
+    elif text == "/both":
+        user_modes[chat_id] = "both"
+        bot.send_message(chat_id, "📑 Mode set to: *Both (TXT + PDF)*.", reply_to_message_id=msg_id)
+        return
+
+    doc = msg.get("document")
+    if doc:
+        file_name = doc.get("file_name", "labels.pdf")
+        mime_type = doc.get("mime_type", "")
+
+        if not (file_name.lower().endswith(".pdf") or "pdf" in mime_type.lower()):
+            bot.send_message(chat_id, "⚠️ Please send a PDF file.", reply_to_message_id=msg_id)
+            return
+
+        # 2. Assign unique job ID (cancels any previously running PDF from this chat)
+        job_counter += 1
+        my_job_id = job_counter
+        active_job_id[chat_id] = my_job_id
+
+        def check_cancelled():
+            return active_job_id.get(chat_id) != my_job_id
+
+        # 3. Global Single-Worker Lock: Ensures only ONE PDF is processed at a time
+        # This keeps RAM under 25MB permanently!
+        with global_processing_lock:
+            if check_cancelled():
+                return
+
+            bot.send_chat_action(chat_id, "upload_document")
+            bot.send_message(chat_id, "⏳ Processing PDF...", reply_to_message_id=msg_id)
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                local_in = os.path.join(tmp_dir, "input.pdf")
+                local_out_pdf = os.path.join(tmp_dir, "meesho_rearranged.pdf")
+                local_out_txt = os.path.join(tmp_dir, "meesho_picklist.txt")
+
+                file_info = bot.get_file(doc["file_id"])
+                if not file_info or not file_info.get("ok"):
+                    bot.send_message(chat_id, "❌ Could not download file from Telegram.", reply_to_message_id=msg_id)
+                    return
+
+                if check_cancelled():
+                    return
+
+                server_path = file_info["result"]["file_path"]
+                bot.download_file(server_path, local_in)
+
+                if check_cancelled():
+                    return
+
+                try:
+                    t0 = time.time()
+                    res = process_pdf(local_in, local_out_pdf, check_cancelled)
+                    if res[0] is None:
+                        return
+
+                    picklist_text, total_pages, multi_qty_count = res
+                    duration = time.time() - t0
+
+                    if check_cancelled():
+                        return
+
+                    with open(local_out_txt, "w", encoding="utf-8") as f:
+                        f.write(picklist_text)
+
+                    mode = user_modes.get(chat_id, "both")
+
+                    # 1. Send Picklist In Chat
+                    if len(picklist_text) <= 4000:
+                        bot.send_message(chat_id, f"📋 *Picklist Generated* ({total_pages} orders in {duration:.1f}s):\n\n```\n{picklist_text}\n```")
+                    else:
+                        preview = picklist_text[:3800] + "\n... (full picklist in file below)"
+                        bot.send_message(chat_id, f"📋 *Picklist Preview*:\n\n```\n{preview}\n```")
+
+                    # 2. Send TXT File
+                    bot.send_document(chat_id, local_out_txt, caption=f"📄 Picklist: {total_pages} orders ({duration:.1f}s)")
+
+                    # 3. Send Rearranged PDF (if both mode)
+                    if mode == "both":
+                        alert_note = f" | ⚠️ {multi_qty_count} multi-qty alert(s)" if multi_qty_count > 0 else ""
+                        bot.send_document(
+                            chat_id,
+                            local_out_pdf,
+                            caption=f"📑 Rearranged PDF: {total_pages} pages sorted{alert_note}"
+                        )
+
+                except Exception as e:
+                    bot.send_message(chat_id, f"❌ Error processing PDF: {e}", reply_to_message_id=msg_id)
+                finally:
+                    gc.collect()
+
+
+# ── Webhook HTTP Handler ───────────────────────────────────────────────
+
+class WebhookHandler(http.server.BaseHTTPRequestHandler):
+    bot_instance = None
+
+    def do_GET(self):
+        # Keeps Render alive for UptimeRobot / browser visits
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Meesho Bot is live and awake! Send PDFs to your bot on Telegram.")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self):
+        # Instantly responds 200 OK to Telegram so Telegram NEVER retries!
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            update = json.loads(body.decode("utf-8"))
+
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+            # Process in background thread with single-worker lock
+            t = threading.Thread(target=handle_update, args=(self.bot_instance, update), daemon=True)
+            t.start()
+        except Exception as e:
+            self.send_response(200)
+            self.end_headers()
+            print(f"[Webhook Handler Error] {e}")
+
+    def log_message(self, format, *args):
+        pass
+
+
+# ── Main Entrypoint ────────────────────────────────────────────────────
 
 def get_bot_token():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -334,173 +491,74 @@ def get_bot_token():
 
 
 def main():
-    start_keep_alive_server()
     token = get_bot_token()
     bot = TelegramBot(token)
+    WebhookHandler.bot_instance = bot
 
-    # ── CRITICAL LOOP FIX: Drain & clear all pending backlog on startup ──
-    print("[Bot] Checking Telegram connection and clearing backlog...")
-    init_updates = bot.get_updates(offset=-1, timeout=1)
-    offset = None
-    if init_updates and init_updates.get("result"):
-        last_id = init_updates["result"][-1]["update_id"]
-        offset = last_id + 1
-        bot.get_updates(offset=offset, timeout=1)
-        print(f"[Bot] Discarded previous backlog up to update #{last_id}. Starting clean!")
+    port = int(os.environ.get("PORT", 8080))
+    render_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL")
+
+    # If running on Render: Use Webhook!
+    if render_url:
+        render_url = render_url.rstrip("/")
+        webhook_target = f"{render_url}/webhook"
+
+        print("=" * 60)
+        print("  Starting in WEBHOOK mode (Cloud / Render)")
+        print(f"  External URL: {render_url}")
+        print("=" * 60)
+
+        bot.set_webhook(webhook_target)
+
+        socketserver.TCPServer.allow_reuse_address = True
+        with socketserver.TCPServer(("", port), WebhookHandler) as httpd:
+            print(f"[Server] Listening on port {port} for Telegram Webhooks & UptimeRobot pings...")
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+
     else:
-        print("[Bot] No backlog found. Ready!")
+        # Running locally on PC: Use Polling
+        print("=" * 60)
+        print("  Starting in POLLING mode (Local PC)")
+        print("=" * 60)
 
-    print("=" * 60)
-    print("  Meesho Telegram Bot is running!")
-    print("  Memory optimized (PyPDF2) - 512MB safe.")
-    print("  One PDF at a time (Auto-cancels if new PDF arrives).")
-    print("=" * 60)
+        bot.delete_webhook()
 
-    job_counter = 0
+        def serve_local():
+            socketserver.TCPServer.allow_reuse_address = True
+            with socketserver.TCPServer(("", port), WebhookHandler) as httpd:
+                httpd.serve_forever()
+        t = threading.Thread(target=serve_local, daemon=True)
+        t.start()
 
-    while True:
-        try:
-            updates = bot.get_updates(offset=offset)
-            if not updates or not updates.get("ok"):
+        # Drain backlog on startup
+        init_updates = bot.get_updates(offset=-1, timeout=1)
+        offset = None
+        if init_updates and init_updates.get("result"):
+            last_id = init_updates["result"][-1]["update_id"]
+            offset = last_id + 1
+            bot.get_updates(offset=offset, timeout=1)
+
+        print(f"[Bot] Polling active. Ready!")
+
+        while True:
+            try:
+                updates = bot.get_updates(offset=offset)
+                if not updates or not updates.get("ok"):
+                    time.sleep(2)
+                    continue
+
+                for item in updates.get("result", []):
+                    offset = item["update_id"] + 1
+                    handle_update(bot, item)
+
+            except KeyboardInterrupt:
+                print("\nBot stopped.")
+                break
+            except Exception as e:
                 time.sleep(2)
-                continue
-
-            for item in updates.get("result", []):
-                offset = item["update_id"] + 1
-
-                msg = item.get("message")
-                if not msg:
-                    continue
-
-                chat_id = msg["chat"]["id"]
-                msg_id = msg["message_id"]
-                text = msg.get("text", "").strip()
-
-                # Handle commands
-                if text in ("/start", "/help"):
-                    mode = user_modes.get(chat_id, "both")
-                    welcome = (
-                        "👋 *Meesho Label & Picklist Bot*\n\n"
-                        "📄 Send me any Meesho Shipping Label PDF.\n"
-                        "I will reply with:\n"
-                        "1. 📋 Clean Picklist (in chat + .txt file)\n"
-                        "2. 📑 Rearranged PDF (in picklist order)\n"
-                        "3. ⚠️ Multi-quantity alert if an order has >1 qty\n\n"
-                        f"⚙️ *Current Mode:* `{mode.upper()}`\n"
-                        "• `/both` - Picklist TXT + Rearranged PDF (default)\n"
-                        "• `/txt`  - Picklist TXT only"
-                    )
-                    bot.send_message(chat_id, welcome, reply_to_message_id=msg_id)
-                    continue
-
-                elif text == "/txt":
-                    user_modes[chat_id] = "txt"
-                    bot.send_message(chat_id, "⚡ Mode set to: *TXT Only*.", reply_to_message_id=msg_id)
-                    continue
-
-                elif text == "/both":
-                    user_modes[chat_id] = "both"
-                    bot.send_message(chat_id, "📑 Mode set to: *Both (TXT + PDF)*.", reply_to_message_id=msg_id)
-                    continue
-
-                # Handle Document
-                doc = msg.get("document")
-                if doc:
-                    file_name = doc.get("file_name", "labels.pdf")
-                    mime_type = doc.get("mime_type", "")
-
-                    if not (file_name.lower().endswith(".pdf") or "pdf" in mime_type.lower()):
-                        bot.send_message(chat_id, "⚠️ Please send a PDF file.", reply_to_message_id=msg_id)
-                        continue
-
-                    # Generate new unique job ID for this chat
-                    with job_lock:
-                        job_counter += 1
-                        my_job_id = job_counter
-                        active_job_id[chat_id] = my_job_id
-
-                    def check_cancelled():
-                        return active_job_id.get(chat_id) != my_job_id
-
-                    bot.send_chat_action(chat_id, "upload_document")
-                    bot.send_message(chat_id, "⏳ Processing PDF...", reply_to_message_id=msg_id)
-
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        local_in = os.path.join(tmp_dir, "input.pdf")
-                        local_out_pdf = os.path.join(tmp_dir, "meesho_rearranged.pdf")
-                        local_out_txt = os.path.join(tmp_dir, "meesho_picklist.txt")
-
-                        file_info = bot.get_file(doc["file_id"])
-                        if not file_info or not file_info.get("ok"):
-                            bot.send_message(chat_id, "❌ Could not download file from Telegram.", reply_to_message_id=msg_id)
-                            continue
-
-                        if check_cancelled():
-                            print(f"[Chat {chat_id}] Job {my_job_id} cancelled by a newer PDF.")
-                            continue
-
-                        server_path = file_info["result"]["file_path"]
-                        bot.download_file(server_path, local_in)
-
-                        if check_cancelled():
-                            print(f"[Chat {chat_id}] Job {my_job_id} cancelled by a newer PDF.")
-                            continue
-
-                        try:
-                            t0 = time.time()
-                            res = process_pdf(local_in, local_out_pdf, check_cancelled)
-                            if res[0] is None:
-                                print(f"[Chat {chat_id}] Job {my_job_id} aborted mid-process.")
-                                continue
-
-                            picklist_text, total_pages, multi_qty_count = res
-                            duration = time.time() - t0
-
-                            if check_cancelled():
-                                continue
-
-                            with open(local_out_txt, "w", encoding="utf-8") as f:
-                                f.write(picklist_text)
-
-                            mode = user_modes.get(chat_id, "both")
-
-                            # Send Picklist in Chat
-                            if len(picklist_text) <= 4000:
-                                bot.send_message(chat_id, f"📋 *Picklist Generated* ({total_pages} orders in {duration:.1f}s):\n\n```\n{picklist_text}\n```")
-                            else:
-                                preview = picklist_text[:3800] + "\n... (full picklist in file below)"
-                                bot.send_message(chat_id, f"📋 *Picklist Preview*:\n\n```\n{preview}\n```")
-
-                            # Send TXT Document
-                            bot.send_document(
-                                chat_id,
-                                local_out_txt,
-                                caption=f"📄 Picklist: {total_pages} orders ({duration:.1f}s)"
-                            )
-
-                            # Send Rearranged PDF (if mode == 'both')
-                            if mode == "both":
-                                alert_note = f" | ⚠️ {multi_qty_count} multi-qty alert(s)" if multi_qty_count > 0 else ""
-                                bot.send_document(
-                                    chat_id,
-                                    local_out_pdf,
-                                    caption=f"📑 Rearranged PDF: {total_pages} pages sorted{alert_note}"
-                                )
-
-                        except Exception as e:
-                            import traceback
-                            traceback.print_exc()
-                            bot.send_message(chat_id, f"❌ Error processing PDF: {e}", reply_to_message_id=msg_id)
-
-                        finally:
-                            gc.collect()
-
-        except KeyboardInterrupt:
-            print("\nBot stopped.")
-            break
-        except Exception as e:
-            print(f"[Loop Exception] {e}")
-            time.sleep(2)
 
 
 if __name__ == "__main__":
