@@ -179,13 +179,16 @@ def detect_courier(page_text):
 
     return "Other"
 
-def parse_edited_picklist_sections(text):
+def parse_user_picklist_robust(text):
     """
-    Parses edited picklist text.
-    Section-aware: separates targets for courier section vs remaining orders section.
-    100% space-proof: accepts any amount of spaces or hyphens.
+    Parses user's edited picklist with 100% tolerance to any headers, spacing, or formatting.
+    Extracts:
+      1. section_targets: { (section, t, s, c): desired_qty }
+      2. global_targets:  { (t, s, c): total_desired_qty }
     """
-    sections = defaultdict(lambda: defaultdict(int))
+    VALID_SIZES = {"M", "L", "XL", "XXL", "XXXL", "2XL", "3XL"}
+    section_targets = {}
+    global_accum = defaultdict(int)
     current_section = "ALL"
     current_type = None
     current_size = None
@@ -195,138 +198,135 @@ def parse_edited_picklist_sections(text):
         if not line:
             continue
 
-        # Check section header before filtering
-        m_sec = re.search(r"(?:🚚|📦)?\s*([A-Za-z0-9_\-\s]+?)\s+ORDERS", line, re.I)
-        if m_sec:
-            sec_word = m_sec.group(1).strip().upper()
-            if "OTHER" in sec_word:
-                current_section = "OTHER"
-            else:
-                current_section = sec_word
-            current_type = None
-            current_size = None
-            continue
-
-        if line.startswith("-") or line.startswith("="):
-            continue
-
-        lower_line = line.lower()
-        if any(lower_line.startswith(prefix) for prefix in (
-            "total", "grand total", "factory total", "anomalies", "at-home",
+        lower = line.lower()
+        # Skip summaries, alerts, totals
+        if any(lower.startswith(p) for p in (
+            "total", "grand total", "factory", "anomalies", "at-home",
             "🏠", "🏭", "📦", "🚚", "📊", "(pages", "!", "*"
         )):
             continue
 
-        # Header like [ P ] or [P] or [ TSHIRT ]
+        # Courier section detection
+        if "ORDERS" in line.upper():
+            if any(c in line.upper() for c in ("XPRESSBEES", "EXPRESS", "XB", "DELHIVERY", "SHADOWFAX", "VALMO", "ECOM", "DTDC", "BLUEDART")):
+                current_section = "COURIER"
+                current_type = None
+                current_size = None
+                continue
+            if "OTHER" in line.upper() or "REMAINING" in line.upper():
+                current_section = "OTHER"
+                current_type = None
+                current_size = None
+                continue
+
+        if line.startswith("-") or line.startswith("="):
+            continue
+
+        # Type header like [ P ] or [P] or [ TSHIRT ]
         m_type = re.match(r"^\[\s*([A-Za-z0-9_-]+)\s*\]", line)
         if m_type:
             current_type = m_type.group(1).upper()
             current_size = None
             continue
 
-        # Size like M, L, XL, XXL, XXXL
+        # Size line like M, L, XL, XXL, XXXL
         parts = line.split()
         if len(parts) == 1 and parts[0].upper() in VALID_SIZES:
             current_size = parts[0].upper()
             continue
 
-        # Inline format: e.g. 'P XL Maroon - 2' or 'P XL Maroon 2'
+        # Inline format with Type, Size, Colour, Qty: e.g. 'P XL Maroon - 2' or 'P XL Maroon 2'
         m_inline = re.match(r"^([A-Za-z0-9_-]+)\s+(M|L|XL|XXL|XXXL|2XL|3XL)\s+([A-Za-z\s]+?)[\s\-:]+(\d+)\s*$", line, re.I)
         if m_inline:
             t = m_inline.group(1).upper()
             s = m_inline.group(2).upper()
             c = re.sub(r"\s+", " ", m_inline.group(3)).strip().lower()
             q = int(m_inline.group(4))
-            sections[current_section][(t, s, c)] += q
+            section_targets[(current_section, t, s, c)] = q
+            global_accum[(t, s, c)] += q
+            continue
+
+        # Inline format with Size, Colour, Qty: e.g. 'XL Maroon 2' or 'XL Maroon - 2'
+        m_size_col = re.match(r"^(M|L|XL|XXL|XXXL|2XL|3XL)\s+([A-Za-z\s]+?)[\s\-:]+(\d+)\s*$", line, re.I)
+        if m_size_col:
+            s = m_size_col.group(1).upper()
+            c = re.sub(r"\s+", " ", m_size_col.group(2)).strip().lower()
+            q = int(m_size_col.group(3))
+            t = current_type if current_type else "P"
+            section_targets[(current_section, t, s, c)] = q
+            global_accum[(t, s, c)] += q
             continue
 
         # Standard block format: e.g. 'Maroon - 2' or 'Maroon-2' or 'Maroon 2'
         clean = re.sub(r"\(ALERT:.*?\)", "", line, flags=re.I).strip()
         m_item = re.match(r"^([A-Za-z\s]+?)[\s\-:]+(\d+)\s*$", clean)
-
         if m_item and current_type and current_size:
             c = re.sub(r"\s+", " ", m_item.group(1)).strip().lower()
             q = int(m_item.group(2))
-            sections[current_section][(current_type, current_size, c)] += q
+            section_targets[(current_section, current_type, current_size, c)] = q
+            global_accum[(current_type, current_size, c)] += q
 
-    return {k: dict(v) for k, v in sections.items()}
+    return section_targets, dict(global_accum)
 
-def partition_labels_by_targets(known_items, section_targets, target_courier=None):
+def partition_labels_ultimate(known_items, section_targets, global_targets, target_courier=None):
     """
     Partitions labels into factory_items vs deducted_items.
-    If section targets exist (e.g. user reduced numbers under Xpressbees),
-    deducts from that courier's items first.
+    Matches section targets if present, falls back cleanly to global targets.
     """
-    has_specific_sections = any(k not in ("ALL", "OTHER") for k in section_targets.keys())
+    groups = defaultdict(list)
+    for it in known_items:
+        t, c, s, q, is_anom, orig_idx, raw, courier = it
+        groups[(t, s, c.lower())].append(it)
+
     factory_items = []
     deducted_items = []
 
-    if has_specific_sections or "OTHER" in section_targets:
-        c_groups = defaultdict(list)
-        o_groups = defaultdict(list)
+    def is_courier_item(it):
+        if not target_courier:
+            return False
+        c = it[7].lower() if len(it) > 7 else ""
+        t_low = target_courier.lower()
+        if t_low in ("xpressbees", "xb", "express", "expressbee", "expressbees"):
+            return c in ("xpressbees", "xb")
+        return t_low in c
 
-        for it in known_items:
-            cname = it[7] if len(it) > 7 else "Other"
-            is_c = bool(target_courier and (
-                cname.lower() == target_courier.lower()
-                or (target_courier.lower() in ("xpressbees", "xb") and cname.lower() in ("xpressbees", "xb"))
-            ))
-            t, col, s, q, *_ = it
-            key = (t, s, col.lower())
-            if is_c:
-                c_groups[key].append(it)
-            else:
-                o_groups[key].append(it)
+    for key, lbl_list in groups.items():
+        t, s, c_lower = key
+        orig_q = sum(it[3] for it in lbl_list)
 
-        # 1. Target courier items
-        c_targets = {}
-        for sec_name, t_dict in section_targets.items():
-            if target_courier and (sec_name.lower() in target_courier.lower() or target_courier.lower() in sec_name.lower()):
-                c_targets = t_dict
-                break
+        c_target = section_targets.get(("COURIER", t, s, c_lower))
+        o_target = section_targets.get(("OTHER", t, s, c_lower))
 
-        for key, lbl_list in c_groups.items():
-            orig_q = sum(it[3] for it in lbl_list)
-            desired_q = c_targets.get(key, orig_q)
-            kept = 0
-            for it in lbl_list:
-                if kept + it[3] <= desired_q:
+        if c_target is not None or o_target is not None:
+            c_lbls = [it for it in lbl_list if is_courier_item(it)]
+            o_lbls = [it for it in lbl_list if not is_courier_item(it)]
+
+            # 1. Courier labels
+            desired_c = c_target if c_target is not None else sum(it[3] for it in c_lbls)
+            kept_c = 0
+            for it in c_lbls:
+                if kept_c + it[3] <= desired_c:
                     factory_items.append(it)
-                    kept += it[3]
+                    kept_c += it[3]
                 else:
                     deducted_items.append(it)
 
-        # 2. Other courier items
-        o_targets = section_targets.get("OTHER", {})
-        for key, lbl_list in o_groups.items():
-            orig_q = sum(it[3] for it in lbl_list)
-            desired_q = o_targets.get(key, orig_q)
-            kept = 0
-            for it in lbl_list:
-                if kept + it[3] <= desired_q:
+            # 2. Other labels
+            desired_o = o_target if o_target is not None else sum(it[3] for it in o_lbls)
+            kept_o = 0
+            for it in o_lbls:
+                if kept_o + it[3] <= desired_o:
                     factory_items.append(it)
-                    kept += it[3]
+                    kept_o += it[3]
                 else:
                     deducted_items.append(it)
 
-    else:
-        # Single picklist (no section headers)
-        targets = section_targets.get("ALL", {})
-        groups = defaultdict(list)
-        for it in known_items:
-            t, col, s, q, *_ = it
-            groups[(t, s, col.lower())].append(it)
-
-        for key, lbl_list in groups.items():
-            orig_q = sum(it[3] for it in lbl_list)
-            desired_q = targets.get(key, orig_q)
-
-            # If user has an active courier, deduct from that courier's labels first!
+        else:
+            # Global target (or single picklist)
+            desired_q = global_targets.get(key, orig_q)
             if target_courier:
-                lbl_list.sort(key=lambda x: 1 if (
-                    x[7].lower() == target_courier.lower()
-                    or (target_courier.lower() in ("xpressbees", "xb") and x[7].lower() in ("xpressbees", "xb"))
-                ) else 0)
+                # Prioritize courier labels for deduction so at-home stock is for that courier
+                lbl_list.sort(key=lambda x: 1 if is_courier_item(x) else 0)
 
             kept = 0
             for it in lbl_list:
@@ -907,8 +907,8 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
         )
         return
 
-    section_targets = parse_edited_picklist_sections(edited_text)
-    if not section_targets or not any(section_targets.values()):
+    section_targets, global_targets = parse_user_picklist_robust(edited_text)
+    if not global_targets:
         bot.send_message(
             chat_id,
             "⚠️ Could not parse any quantities from your text.\n"
@@ -923,7 +923,7 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
     last_courier = batch.get("last_courier")
 
     # Partition labels into factory_items vs deducted_items (respecting section edits)
-    factory_items, deducted_items = partition_labels_by_targets(known, section_targets, target_courier=last_courier)
+    factory_items, deducted_items = partition_labels_ultimate(known, section_targets, global_targets, target_courier=last_courier)
 
     if not deducted_items:
         bot.send_message(
