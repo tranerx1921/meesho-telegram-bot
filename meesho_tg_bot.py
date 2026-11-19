@@ -1071,6 +1071,134 @@ def handle_reset_courier(bot, chat_id, msg_id):
         )
 
 
+def analyze_meesho_html(html_content):
+    """Parses Meesho Ready to Ship table HTML and returns packed/unpacked stats."""
+    soup = None
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_content, 'html.parser')
+    except Exception:
+        pass
+
+    if soup:
+        table = soup.find('table')
+        sku_col, qty_col, size_col = 3, 5, 6
+        if table:
+            ths = table.find_all('th')
+            for i, th in enumerate(ths):
+                t = th.get_text(strip=True).lower()
+                if 'sku' in t: sku_col = i
+                elif 'quantity' in t or 'qty' in t: qty_col = i
+                elif 'size' in t: size_col = i
+
+        rows = soup.find_all('tr', attrs={'data-index': True})
+        if not rows and table:
+            tbody = table.find('tbody')
+            if tbody:
+                rows = tbody.find_all('tr')
+    else:
+        # Regex fallback when BeautifulSoup is unavailable
+        row_chunks = re.findall(r'<tr[^>]*data-index[^>]*>(.*?)</tr>', html_content, flags=re.DOTALL | re.I)
+        total_orders = len(row_chunks)
+        packed_count = 0
+        unpacked_count = 0
+        unpacked_summary = defaultdict(int)
+        for chunk in row_chunks:
+            tds = re.findall(r'<td[^>]*>(.*?)</td>', chunk, flags=re.DOTALL | re.I)
+            if len(tds) < 5: continue
+            clean_tds = [re.sub(r'<[^>]+>', ' ', td).strip() for td in tds]
+            full_text = ' '.join(clean_tds)
+            sku = re.sub(r'\s+', ' ', clean_tds[3]).strip() if len(clean_tds) > 3 else 'Unknown'
+            size = clean_tds[6].strip() if len(clean_tds) > 6 else 'Unknown'
+            qty_str = clean_tds[5].strip() if len(clean_tds) > 5 else '1'
+            m = re.search(r'\d+', qty_str)
+            qty = int(m.group()) if m else 1
+            has_packet = bool(re.search(r'packet\s*id|pid[:\s]|packet\s*#', full_text, re.I))
+            key = f'{sku} ({size})'
+            if has_packet:
+                packed_count += qty
+            else:
+                unpacked_count += qty
+                unpacked_summary[key] += qty
+        return total_orders, packed_count, unpacked_count, dict(unpacked_summary)
+
+    total_orders = len(rows)
+    packed_count = 0
+    unpacked_count = 0
+    unpacked_summary = defaultdict(int)
+
+    for r in rows:
+        tds = r.find_all('td')
+        if len(tds) < 5:
+            continue
+        
+        full_text = r.get_text(' ', strip=True)
+        sku = tds[sku_col].get_text(strip=True) if len(tds) > sku_col else 'Unknown'
+        sku = re.sub(r'\s+', ' ', sku).strip()
+        size = tds[size_col].get_text(strip=True) if len(tds) > size_col else 'Unknown'
+        qty_str = tds[qty_col].get_text(strip=True) if len(tds) > qty_col else '1'
+        m = re.search(r'\d+', qty_str)
+        qty = int(m.group()) if m else 1
+
+        has_packet = bool(re.search(r'packet\s*id|pid[:\s]|packet\s*#', full_text, re.I))
+        if not has_packet and len(tds) > 1:
+            p_tags = tds[1].find_all('p')
+            if len(p_tags) > 2:
+                for p in p_tags[2:]:
+                    if re.search(r'packet|\b\d{6,}\b', p.get_text(strip=True), re.I):
+                        has_packet = True
+                        break
+
+        key = f'{sku} ({size})'
+        if has_packet:
+            packed_count += qty
+        else:
+            unpacked_count += qty
+            unpacked_summary[key] += qty
+
+    return total_orders, packed_count, unpacked_count, dict(unpacked_summary)
+
+
+def handle_html_analysis(bot, chat_id, msg_id, doc):
+    """Processes an uploaded Meesho Supplier Panel HTML file."""
+    bot.send_chat_action(chat_id, "typing")
+    file_info = bot.get_file(doc["file_id"])
+    if not file_info or not file_info.get("ok"):
+        bot.send_message(chat_id, "❌ Could not download HTML file from Telegram.", reply_to_message_id=msg_id)
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        local_in = os.path.join(tmp_dir, "panel.html")
+        server_path = file_info["result"]["file_path"]
+        bot.download_file(server_path, local_in)
+
+        try:
+            with open(local_in, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            total, packed, unpacked, summary = analyze_meesho_html(content)
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Failed to parse HTML file: {e}", reply_to_message_id=msg_id)
+            return
+
+    lines = [
+        "📦 *Meesho Ready-to-Ship Scan Report*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 *Total Orders Found:* `{total}`",
+        f"✅ *Packed (Has Packet ID):* `{packed}`",
+        f"🔴 *Unpacked Remaining:* `{unpacked}` pcs\n"
+    ]
+    if unpacked == 0:
+        lines.append("🎉 *Awesome! All orders have Packet IDs and are PACKED!*")
+    else:
+        lines.append("📋 *Unpacked Items Breakdown:*")
+        for k, v in sorted(summary.items(), key=lambda x: -x[1]):
+            lines.append(f"• *{k}* - `{v} pcs`")
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 *Tip:* To adjust your picklist, copy the unpacked items above and send `/adjust`!")
+
+    bot.send_message(chat_id, "\n".join(lines), reply_to_message_id=msg_id)
+
+
 # ── Update Processing Worker ───────────────────────────────────────────
 
 def process_single_message(bot, item):
@@ -1152,20 +1280,39 @@ def process_single_message(bot, item):
         handle_reset_courier(bot, chat_id, msg_id)
         return
 
+    if cmd in ("/scan", "/unpacked", "/bookmarklet"):
+        msg_text = (
+            "📱 *Meesho Mobile Unpacked Checker*\n\n"
+            "Here is how to check unpacked orders directly on your Android phone:\n\n"
+            "🔹 *Method 1: 1-Tap Mobile Chrome Bookmarklet (Instant)*\n"
+            "Run directly while viewing `supplier.meesho.com`!\n"
+            "It scans loaded orders, highlights unpacked items in yellow, and shows a floating HUD with packed vs unpacked counts.\n\n"
+            "🔹 *Method 2: Send HTML Page to this Bot*\n"
+            "In Android Chrome, tap `⋮ (Menu)` -> `Download` (downloads the HTML). Then send that `.html` file "
+            "directly to this chat, and I'll analyze packed vs unpacked for you instantly!"
+        )
+        bot.send_message(chat_id, msg_text, reply_to_message_id=msg_id)
+        return
+
     # Check if user was waiting to send adjustment text OR if message looks like a picklist
     if chat_id in user_waiting_adjust or ("[" in text and any(s in text.upper() for s in ("M", "L", "XL", "XXL", "XXXL"))):
         user_waiting_adjust.discard(chat_id)
         handle_adjustment(bot, chat_id, msg_id, text)
         return
 
-    # 2. PDF Document Handling
+    # 2. Document Handling (PDF / Meesho HTML)
     doc = msg.get("document")
     if doc:
         file_name = doc.get("file_name", "labels.pdf")
         mime_type = doc.get("mime_type", "")
 
+        # Check if Meesho HTML file
+        if file_name.lower().endswith(".html") or file_name.lower().endswith(".htm") or "html" in mime_type.lower():
+            handle_html_analysis(bot, chat_id, msg_id, doc)
+            return
+
         if not (file_name.lower().endswith(".pdf") or "pdf" in mime_type.lower()):
-            bot.send_message(chat_id, "⚠️ Please send a PDF file.", reply_to_message_id=msg_id)
+            bot.send_message(chat_id, "⚠️ Please send a PDF or Meesho HTML file.", reply_to_message_id=msg_id)
             return
 
         job_counter += 1
