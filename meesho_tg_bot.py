@@ -1,15 +1,20 @@
 """
-Meesho Telegram Bot (Ultra-Fast pypdfium2, Zero-Loop, Picklist Adjustment)
-============================================================================
-- Features:
-  1. Sends Meesho PDF -> Generates Picklist + Rearranged PDF in seconds.
-  2. /adjust Command:
-     - Copy the picklist, change the numbers for stock you have at home, send it to the bot.
-     - Bot calculates deducted pieces and MOVES THEIR LABELS TO THE VERY END (TAIL) OF THE PDF!
-     - Sends updated factory picklist + adjusted PDF so you can grab the tail labels easily.
-  3. Ultra-Low RAM: Google's C++ PDFium engine (pypdfium2, ~2MB RAM).
-  4. Mathematical Zero-Loop Guarantee with immediate Telegram confirmation.
-  5. Built-in Keep-Alive server for UptimeRobot (24/7 on Render).
+Meesho Telegram Bot (Ultra-Fast pypdfium2, Zero-Loop, Picklist Adjustment & Courier Split)
+==========================================================================================
+Features:
+  1. Ultra-Low RAM: Google's C++ PDFium engine (pypdfium2, ~2MB RAM).
+  2. Mathematical Zero-Loop Guarantee with immediate Telegram confirmation.
+  3. Built-in Keep-Alive server for UptimeRobot (24/7 on Render free tier).
+  4. /adjust Command:
+     - Copy picklist, edit numbers for stock you have at home.
+     - Bot automatically moves at-home labels to the end of the PDF!
+  5. Courier Partner Extraction (/ex, /del, /sf, /vl, /courier):
+     - Separate orders by courier (e.g. /ex for Xpressbees).
+     - Selected courier orders move to the FIRST PART (TOP) of the PDF and picklist,
+       in the exact same organized order (Type -> Size -> Colour).
+     - ANY at-home stock for that courier is placed at the VERY END OF THAT COURIER'S BLOCK!
+       So you can grab the courier stack off the printer and peel off its at-home labels immediately!
+     - Remaining orders follow underneath (with any other at-home stock at the very end of the PDF).
 """
 
 import os
@@ -35,10 +40,31 @@ SIZE_ORDER = {"M": 0, "L": 1, "XL": 2, "XXL": 3, "XXXL": 4}
 SIZE_LIST = ["M", "L", "XL", "XXL", "XXXL"]
 VALID_SIZES = set(SIZE_LIST)
 
+COURIER_CMD_MAP = {
+    "/ex": "Xpressbees",
+    "/xb": "Xpressbees",
+    "/xpressbees": "Xpressbees",
+    "/expressbee": "Xpressbees",
+    "/expressbees": "Xpressbees",
+    "/xpressbee": "Xpressbees",
+    "/del": "Delhivery",
+    "/delhivery": "Delhivery",
+    "/dl": "Delhivery",
+    "/sf": "Shadowfax",
+    "/shadowfax": "Shadowfax",
+    "/shadow": "Shadowfax",
+    "/vl": "Valmo",
+    "/valmo": "Valmo",
+    "/ecom": "Ecom Express",
+    "/ecomexpress": "Ecom Express",
+    "/dtdc": "DTDC",
+    "/bluedart": "BlueDart",
+}
+
 processed_update_ids = set()
 active_job_id = {}
 user_modes = {}
-user_last_batch = {}      # chat_id -> {"pdf_path", "items", "known", "anomalies"}
+user_last_batch = {}        # chat_id -> dict with pdf_path, known, anomalies, factory_items, tail_items, last_courier
 user_waiting_adjust = set() # chat_ids waiting to send edited picklist
 job_counter = 0
 processing_lock = threading.Lock()
@@ -74,7 +100,7 @@ def start_keep_alive_server(port):
     t.start()
 
 
-# ── Fast & Ultra-Low RAM PDF Engine (pypdfium2: ~2MB RAM) ─────────────
+# ── Fast & Ultra-Low RAM PDF & SKU Helpers ─────────────────────────────
 
 def normalize_size(raw):
     return raw.strip().upper()
@@ -102,8 +128,6 @@ def parse_sku(sku_line):
             break
 
     if size_idx is None or size_idx < 2:
-        if size_idx == 1:
-            return (sku_line, "", "", 1, True)
         return (sku_line, "", "", 1, True)
 
     pre_size = parts[:size_idx]
@@ -125,24 +149,71 @@ def parse_sku(sku_line):
 
     return (ttype, colour, size, qty, False)
 
-def parse_edited_picklist(text):
+def detect_courier(page_text):
+    """Detects shipping courier partner from Meesho label text."""
+    text_lower = page_text.lower()
+    if (
+        re.search(r"\b(xpressbees|xpress\s*bees)\b", text_lower)
+        or re.search(r"\bXB[-_ ]", page_text)
+        or re.search(r"\bXB\b", page_text)
+    ):
+        return "Xpressbees"
+    elif "delhivery" in text_lower:
+        return "Delhivery"
+    elif "shadowfax" in text_lower or re.search(r"\bSF\d{6,}", page_text):
+        return "Shadowfax"
+    elif "valmo" in text_lower or re.search(r"\bVL\d{6,}", page_text):
+        return "Valmo"
+    elif "ecom express" in text_lower or "ecomexpress" in text_lower:
+        return "Ecom Express"
+    elif "dtdc" in text_lower:
+        return "DTDC"
+    elif "bluedart" in text_lower or "blue dart" in text_lower:
+        return "BlueDart"
+
+    m = re.search(r"(?:prepaid|cod)[^\n]*\n+([A-Za-z\s]+?)(?:Pickup|Destination|\n)", page_text, re.I)
+    if m:
+        cand = m.group(1).strip()
+        if cand and len(cand) > 2 and cand.lower() not in ("if", "return", "asj"):
+            return cand.title()
+
+    return "Other"
+
+def parse_edited_picklist_sections(text):
     """
-    Parses edited picklist text from user.
-    100% space-proof: handles any amount of spaces or hyphens between colour and quantity.
+    Parses edited picklist text.
+    Section-aware: separates targets for courier section vs remaining orders section.
+    100% space-proof: accepts any amount of spaces or hyphens.
     """
+    sections = defaultdict(lambda: defaultdict(int))
+    current_section = "ALL"
     current_type = None
     current_size = None
-    target_counts = {}
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("-") or line.startswith("="):
+        if not line:
             continue
 
-        # Skip summary, alert, and total lines
+        # Check section header before filtering
+        m_sec = re.search(r"(?:🚚|📦)?\s*([A-Za-z0-9_\-\s]+?)\s+ORDERS", line, re.I)
+        if m_sec:
+            sec_word = m_sec.group(1).strip().upper()
+            if "OTHER" in sec_word:
+                current_section = "OTHER"
+            else:
+                current_section = sec_word
+            current_type = None
+            current_size = None
+            continue
+
+        if line.startswith("-") or line.startswith("="):
+            continue
+
         lower_line = line.lower()
         if any(lower_line.startswith(prefix) for prefix in (
-            "total", "grand total", "factory total", "anomalies", "at-home", "🏠", "🏭", "(pages", "!", "*"
+            "total", "grand total", "factory total", "anomalies", "at-home",
+            "🏠", "🏭", "📦", "🚚", "📊", "(pages", "!", "*"
         )):
             continue
 
@@ -166,7 +237,7 @@ def parse_edited_picklist(text):
             s = m_inline.group(2).upper()
             c = re.sub(r"\s+", " ", m_inline.group(3)).strip().lower()
             q = int(m_inline.group(4))
-            target_counts[(t, s, c)] = q
+            sections[current_section][(t, s, c)] += q
             continue
 
         # Standard block format: e.g. 'Maroon - 2' or 'Maroon-2' or 'Maroon 2'
@@ -176,12 +247,102 @@ def parse_edited_picklist(text):
         if m_item and current_type and current_size:
             c = re.sub(r"\s+", " ", m_item.group(1)).strip().lower()
             q = int(m_item.group(2))
-            target_counts[(current_type, current_size, c)] = q
+            sections[current_section][(current_type, current_size, c)] += q
 
-    return target_counts
+    return {k: dict(v) for k, v in sections.items()}
 
-def build_picklist_text(items, anomalies=None, tail_items=None):
-    """Generates clean formatted picklist text with compact 'Colour - Count' spacing."""
+def partition_labels_by_targets(known_items, section_targets, target_courier=None):
+    """
+    Partitions labels into factory_items vs deducted_items.
+    If section targets exist (e.g. user reduced numbers under Xpressbees),
+    deducts from that courier's items first.
+    """
+    has_specific_sections = any(k not in ("ALL", "OTHER") for k in section_targets.keys())
+    factory_items = []
+    deducted_items = []
+
+    if has_specific_sections or "OTHER" in section_targets:
+        c_groups = defaultdict(list)
+        o_groups = defaultdict(list)
+
+        for it in known_items:
+            cname = it[7] if len(it) > 7 else "Other"
+            is_c = bool(target_courier and (
+                cname.lower() == target_courier.lower()
+                or (target_courier.lower() in ("xpressbees", "xb") and cname.lower() in ("xpressbees", "xb"))
+            ))
+            t, col, s, q, *_ = it
+            key = (t, s, col.lower())
+            if is_c:
+                c_groups[key].append(it)
+            else:
+                o_groups[key].append(it)
+
+        # 1. Target courier items
+        c_targets = {}
+        for sec_name, t_dict in section_targets.items():
+            if target_courier and (sec_name.lower() in target_courier.lower() or target_courier.lower() in sec_name.lower()):
+                c_targets = t_dict
+                break
+
+        for key, lbl_list in c_groups.items():
+            orig_q = sum(it[3] for it in lbl_list)
+            desired_q = c_targets.get(key, orig_q)
+            kept = 0
+            for it in lbl_list:
+                if kept + it[3] <= desired_q:
+                    factory_items.append(it)
+                    kept += it[3]
+                else:
+                    deducted_items.append(it)
+
+        # 2. Other courier items
+        o_targets = section_targets.get("OTHER", {})
+        for key, lbl_list in o_groups.items():
+            orig_q = sum(it[3] for it in lbl_list)
+            desired_q = o_targets.get(key, orig_q)
+            kept = 0
+            for it in lbl_list:
+                if kept + it[3] <= desired_q:
+                    factory_items.append(it)
+                    kept += it[3]
+                else:
+                    deducted_items.append(it)
+
+    else:
+        # Single picklist (no section headers)
+        targets = section_targets.get("ALL", {})
+        groups = defaultdict(list)
+        for it in known_items:
+            t, col, s, q, *_ = it
+            groups[(t, s, col.lower())].append(it)
+
+        for key, lbl_list in groups.items():
+            orig_q = sum(it[3] for it in lbl_list)
+            desired_q = targets.get(key, orig_q)
+
+            # If user has an active courier, deduct from that courier's labels first!
+            if target_courier:
+                lbl_list.sort(key=lambda x: 1 if (
+                    x[7].lower() == target_courier.lower()
+                    or (target_courier.lower() in ("xpressbees", "xb") and x[7].lower() in ("xpressbees", "xb"))
+                ) else 0)
+
+            kept = 0
+            for it in lbl_list:
+                if kept + it[3] <= desired_q:
+                    factory_items.append(it)
+                    kept += it[3]
+                else:
+                    deducted_items.append(it)
+
+    return factory_items, deducted_items
+
+
+# ── Picklist Formatter Functions ───────────────────────────────────────
+
+def build_section_text(items):
+    """Builds clean, compact Type -> Size -> Colour picklist lines for a list of items."""
     picklist_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for t, c, s, qty, *_ in items:
         picklist_data[t][s][c].append(qty)
@@ -225,7 +386,16 @@ def build_picklist_text(items, anomalies=None, tail_items=None):
         lines.append("- - - - - - - - - - - - - - -")
         lines.append("")
 
-    total_pcs = sum(sum(qtys) for t_dict in picklist_data.values() for s_dict in t_dict.values() for qtys in s_dict.values())
+    return "\n".join(lines).rstrip()
+
+def build_picklist_text(items, anomalies=None, tail_items=None):
+    """Generates complete picklist text for a standard single-group batch."""
+    lines = []
+    if items:
+        lines.append(build_section_text(items))
+        lines.append("")
+
+    total_pcs = sum(it[3] for it in items)
     total_labels = len(items)
 
     if total_pcs != total_labels:
@@ -236,18 +406,17 @@ def build_picklist_text(items, anomalies=None, tail_items=None):
     if anomalies:
         lines.append(f"Anomalies : {len(anomalies)}")
         for a in anomalies:
-            desc = a[6] if a[6] else a[1]
+            desc = a[6] if len(a) > 6 and a[6] else a[1]
             lines.append(f"   {desc}")
 
-    # Add At-Home Stock info at the bottom if tail items exist
     if tail_items:
         start_tail = len(items) + (len(anomalies) if anomalies else 0) + 1
         end_tail = len(items) + (len(anomalies) if anomalies else 0) + len(tail_items)
         lines.append("")
-        lines.append("=" * 40)
+        lines.append("=" * 42)
         lines.append(f"🏠 AT-HOME / TAIL LABELS: {len(tail_items)} pcs")
         lines.append(f"(Pages {start_tail} to {end_tail} at the VERY END of PDF)")
-        lines.append("=" * 40)
+        lines.append("=" * 42)
 
         tail_summary = defaultdict(int)
         for t, c, s, q, *_ in tail_items:
@@ -257,6 +426,107 @@ def build_picklist_text(items, anomalies=None, tail_items=None):
 
     return "\n".join(lines)
 
+def build_courier_split_picklist_text(courier_name, courier_factory, courier_at_home,
+                                      other_factory, other_at_home, anomalies=None):
+    """
+    Generates dual-section picklist:
+    - Selected courier on top (with its at-home stock at the end of its block!)
+    - Remaining courier orders below (with any other at-home stock at the very end of the PDF).
+    """
+    lines = []
+
+    # Total courier numbers
+    n_cf = len(courier_factory)
+    n_ca = len(courier_at_home)
+    total_c_labels = n_cf + n_ca
+    total_c_pcs = sum(it[3] for it in courier_factory) + sum(it[3] for it in courier_at_home)
+    c_range = f"Pages 1 to {total_c_labels}"
+
+    lines.append("=" * 42)
+    lines.append(f"🚚 {courier_name.upper()} ORDERS ({total_c_pcs} pcs - {c_range})")
+    lines.append("=" * 42)
+    lines.append("")
+
+    if n_ca > 0:
+        lines.append(f"🏭 FACTORY ORDERS ({sum(it[3] for it in courier_factory)} pcs - Pages 1 to {n_cf}):")
+        lines.append("")
+
+    if courier_factory:
+        lines.append(build_section_text(courier_factory))
+        lines.append("")
+
+    # At-Home stock for this courier placed at the VERY END of this courier's block!
+    if n_ca > 0:
+        c_at_home_start = n_cf + 1
+        c_at_home_end = total_c_labels
+        lines.append("=" * 42)
+        lines.append(f"🏠 {courier_name.upper()} AT-HOME STOCK: {sum(it[3] for it in courier_at_home)} pcs")
+        lines.append(f"(Pages {c_at_home_start} to {c_at_home_end} at END of {courier_name})")
+        lines.append("=" * 42)
+        c_tail_summary = defaultdict(int)
+        for t, c, s, q, *_ in courier_at_home:
+            c_tail_summary[f"{t} {c} {s}"] += q
+        for desc, cnt in sorted(c_tail_summary.items()):
+            lines.append(f"   • {desc:<20} {cnt} pcs")
+        lines.append("")
+
+    # Other couriers
+    n_of = len(other_factory)
+    n_oa = len(other_at_home)
+    total_o_labels = n_of + n_oa
+    total_o_pcs = sum(it[3] for it in other_factory) + sum(it[3] for it in other_at_home)
+
+    if total_o_labels > 0:
+        start_other = total_c_labels + 1
+        end_other = total_c_labels + total_o_labels
+        lines.append("=" * 42)
+        lines.append(f"📦 OTHER COURIER ORDERS ({total_o_pcs} pcs - Pages {start_other} to {end_other})")
+        lines.append("=" * 42)
+        lines.append("")
+
+        if n_oa > 0:
+            lines.append(f"🏭 FACTORY ORDERS ({sum(it[3] for it in other_factory)} pcs - Pages {start_other} to {start_other + n_of - 1}):")
+            lines.append("")
+
+        if other_factory:
+            lines.append(build_section_text(other_factory))
+            lines.append("")
+
+        if n_oa > 0:
+            o_at_home_start = total_c_labels + n_of + (len(anomalies) if anomalies else 0) + 1
+            o_at_home_end = end_other + (len(anomalies) if anomalies else 0)
+            lines.append("=" * 42)
+            lines.append(f"🏠 OTHER AT-HOME STOCK: {sum(it[3] for it in other_at_home)} pcs")
+            lines.append(f"(Pages {o_at_home_start} to {o_at_home_end} at VERY END of PDF)")
+            lines.append("=" * 42)
+            o_tail_summary = defaultdict(int)
+            for t, c, s, q, *_ in other_at_home:
+                o_tail_summary[f"{t} {c} {s}"] += q
+            for desc, cnt in sorted(o_tail_summary.items()):
+                lines.append(f"   • {desc:<20} {cnt} pcs")
+            lines.append("")
+
+    if anomalies:
+        lines.append(f"Anomalies : {len(anomalies)}")
+        for a in anomalies:
+            desc = a[6] if len(a) > 6 and a[6] else a[1]
+            lines.append(f"   {desc}")
+        lines.append("")
+
+    # Summary
+    lines.append("=" * 42)
+    lines.append(f"📊 BATCH SUMMARY: {total_c_labels + total_o_labels} orders ({total_c_pcs + total_o_pcs} pcs)")
+    lines.append("=" * 42)
+    c_tail_note = f" ({n_cf} factory + {n_ca} at-home)" if n_ca > 0 else ""
+    lines.append(f"   • {courier_name}: {total_c_pcs} pcs{c_tail_note} -> Pages 1 to {total_c_labels}")
+    if total_o_labels > 0:
+        o_tail_note = f" ({n_of} factory + {n_oa} at-home)" if n_oa > 0 else ""
+        lines.append(f"   • Other Couriers: {total_o_pcs} pcs{o_tail_note} -> Pages {total_c_labels+1} to {total_c_labels+total_o_labels}")
+
+    return "\n".join(lines)
+
+
+# ── PDF Processing Engine ──────────────────────────────────────────────
 
 def process_initial_pdf(input_pdf_path, output_pdf_path, check_cancelled):
     pdf = pypdfium2.PdfDocument(input_pdf_path)
@@ -274,13 +544,14 @@ def process_initial_pdf(input_pdf_path, output_pdf_path, check_cancelled):
         tp.close()
         page.close()
 
+        courier = detect_courier(text)
         sku_line = extract_sku_line(text)
         if sku_line is None:
-            items.append(("UNKNOWN", f"PAGE_{idx+1}", "", 1, True, idx, ""))
+            items.append(("UNKNOWN", f"PAGE_{idx+1}", "", 1, True, idx, "", courier))
             continue
 
         ttype, colour, size, qty, is_anomaly = parse_sku(sku_line)
-        items.append((ttype, colour, size, qty, is_anomaly, idx, sku_line))
+        items.append((ttype, colour, size, qty, is_anomaly, idx, sku_line, courier))
 
     if check_cancelled():
         pdf.close()
@@ -294,14 +565,14 @@ def process_initial_pdf(input_pdf_path, output_pdf_path, check_cancelled):
         return (t.lower(), SIZE_ORDER.get(s, 99), c.lower())
 
     known.sort(key=sort_key)
-    anomalies.sort(key=lambda x: x[6].lower() if x[6] else x[1].lower())
+    anomalies.sort(key=lambda x: x[6].lower() if len(x) > 6 and x[6] else x[1].lower())
 
     ordered = known + anomalies
     picklist_text = build_picklist_text(known, anomalies)
 
     multi_qty_alerts = []
     for new_page_idx, it in enumerate(ordered):
-        t, c, s, qty, is_anom, orig_idx, raw = it
+        t, c, s, qty, is_anom, orig_idx, raw, *rest = it
         if qty > 1:
             multi_qty_alerts.append(f"   Page {new_page_idx + 1}: {t} {c} {s} -> Qty {qty}")
 
@@ -340,7 +611,8 @@ class TelegramBot:
             data["reply_to_message_id"] = reply_to_message_id
         try:
             return requests.post(url, data=data, timeout=15).json()
-        except Exception:
+        except Exception as e:
+            print(f"[Telegram] sendMessage notice: {e}")
             return None
 
     def send_chat_action(self, chat_id, action="typing"):
@@ -353,17 +625,40 @@ class TelegramBot:
         url = f"{self.base_url}/sendDocument"
         data = {"chat_id": chat_id}
         if caption:
-            data["caption"] = caption
+            data["caption"] = caption[:1000] # Safe limit under Telegram 1024
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
 
-        try:
-            filename = os.path.basename(file_path)
-            with open(file_path, "rb") as f:
-                files = {"document": (filename, f)}
-                return requests.post(url, data=data, files=files, timeout=90).json()
-        except Exception:
-            return None
+        filename = os.path.basename(file_path)
+        for attempt in range(3):
+            try:
+                with open(file_path, "rb") as f:
+                    files = {"document": (filename, f)}
+                    resp = requests.post(url, data=data, files=files, timeout=120)
+
+                if resp.status_code == 200:
+                    res_json = resp.json()
+                    if res_json.get("ok"):
+                        print(f"[Telegram] Sent document successfully: {filename}")
+                        return res_json
+                    else:
+                        print(f"[Telegram] sendDocument error response: {resp.text}")
+                elif resp.status_code == 429:
+                    retry_after = 3
+                    try:
+                        retry_after = resp.json().get("parameters", {}).get("retry_after", 3)
+                    except Exception:
+                        pass
+                    print(f"[Telegram] Rate limited (429). Retrying after {retry_after}s...")
+                    time.sleep(retry_after)
+                    continue
+                else:
+                    print(f"[Telegram] sendDocument failed (code {resp.status_code}): {resp.text}")
+            except Exception as e:
+                print(f"[Telegram] sendDocument exception (attempt {attempt+1}/3): {e}")
+                time.sleep(2)
+
+        return None
 
     def get_file(self, file_id):
         try:
@@ -398,7 +693,209 @@ class TelegramBot:
             return None
 
 
-# ── Picklist Adjustment Handler (At-Home Stock to Tail) ────────────────
+# ── Courier Separation Handler (/ex, /del, /sf, /vl, /courier) ─────────
+
+def handle_courier_split(bot, chat_id, msg_id, target_courier):
+    batch = user_last_batch.get(chat_id)
+    if not batch or not os.path.exists(batch["pdf_path"]):
+        bot.send_message(
+            chat_id,
+            "⚠️ No previous PDF found in memory!\n"
+            "Please send your Meesho PDF first, then you can extract courier orders.",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    pdf_source = batch["pdf_path"]
+    anomalies = batch.get("anomalies", [])
+    known = batch["known"]
+
+    # Deducted / At-home items (from /adjust)
+    deducted_items = batch.get("tail_items", [])
+    # Active factory items
+    factory_items = batch.get("factory_items") if batch.get("factory_items") is not None else known
+
+    # Tally available couriers across all known items
+    courier_counts = defaultdict(int)
+    for it in known:
+        cname = it[7] if len(it) > 7 else "Other"
+        courier_counts[cname] += it[3]
+
+    # If target_courier is empty, list all couriers in batch
+    if not target_courier:
+        lines = ["🚚 *Available Couriers in Current Batch:*\n"]
+        for cname, cnt in sorted(courier_counts.items(), key=lambda x: -x[1]):
+            sc = "/ex" if cname.lower() == "xpressbees" else (
+                "/del" if cname.lower() == "delhivery" else (
+                    "/sf" if cname.lower() == "shadowfax" else (
+                        "/vl" if cname.lower() == "valmo" else f"/courier {cname.lower()}"
+                    )
+                )
+            )
+            lines.append(f"• *{cname}:* {cnt} pcs (Tap {sc})")
+        lines.append("\n👉 Tap any command above to move that courier's orders to the TOP of the PDF and picklist!")
+        bot.send_message(chat_id, "\n".join(lines), reply_to_message_id=msg_id)
+        return
+
+    target_lower = target_courier.lower()
+
+    def is_target_courier(it):
+        c = it[7].lower() if len(it) > 7 else "other"
+        if target_lower in ("xpressbees", "xb", "expressbee", "expressbees", "ex"):
+            return c in ("xpressbees", "xb")
+        elif target_lower in ("delhivery", "del", "dl"):
+            return "delhivery" in c
+        elif target_lower in ("shadowfax", "sf", "shadow"):
+            return "shadowfax" in c
+        elif target_lower in ("valmo", "vl"):
+            return "valmo" in c
+        elif target_lower in ("ecom", "ecom express", "ecomexpress"):
+            return "ecom" in c
+        return target_lower in c
+
+    # Separate Factory items
+    courier_factory = [it for it in factory_items if is_target_courier(it)]
+    other_factory = [it for it in factory_items if not is_target_courier(it)]
+
+    # Separate At-Home (deducted) items
+    courier_at_home = [it for it in deducted_items if is_target_courier(it)]
+    other_at_home = [it for it in deducted_items if not is_target_courier(it)]
+
+    total_c_labels = len(courier_factory) + len(courier_at_home)
+    if total_c_labels == 0:
+        lines = [
+            f"⚠️ No orders found for *{target_courier.title()}* in this batch!\n",
+            "🚚 *Available Couriers in this batch:*"
+        ]
+        for cname, cnt in sorted(courier_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"• *{cname}:* {cnt} pcs")
+        bot.send_message(chat_id, "\n".join(lines), reply_to_message_id=msg_id)
+        return
+
+    # Sort each list in standard hierarchy: Type -> Size -> Colour
+    def sort_key(it):
+        t, c, s, qty, *_ = it
+        return (t.lower(), SIZE_ORDER.get(s, 99), c.lower())
+
+    courier_factory.sort(key=sort_key)
+    courier_at_home.sort(key=sort_key)
+    other_factory.sort(key=sort_key)
+    other_at_home.sort(key=sort_key)
+
+    c_display_name = (courier_factory or courier_at_home)[0][7]
+
+    bot.send_chat_action(chat_id, "upload_document")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        clean_cname = re.sub(r"[^A-Za-z0-9]", "_", c_display_name).lower()
+        out_pdf_path = os.path.join(tmp_dir, f"meesho_{clean_cname}_separated.pdf")
+        out_txt_path = os.path.join(tmp_dir, f"meesho_{clean_cname}_picklist.txt")
+
+        # 1. Build Split Picklist Text
+        picklist_text = build_courier_split_picklist_text(
+            c_display_name, courier_factory, courier_at_home,
+            other_factory, other_at_home, anomalies=anomalies
+        )
+
+        n_cf = len(courier_factory)
+        n_ca = len(courier_at_home)
+        n_of = len(other_factory)
+        n_oa = len(other_at_home)
+        n_anom = len(anomalies)
+
+        # REORDER SEQUENCE:
+        # [courier_factory] -> [courier_at_home (at END of courier!)] -> [other_factory] -> [anomalies] -> [other_at_home]
+        all_reordered = courier_factory + courier_at_home + other_factory + anomalies + other_at_home
+
+        # Multi-qty alerts with updated page numbers
+        multi_qty_alerts = []
+        for new_page_idx, it in enumerate(all_reordered):
+            if it[3] > 1:
+                multi_qty_alerts.append(f"   Page {new_page_idx + 1}: {it[0]} {it[1]} {it[2]} -> Qty {it[3]}")
+
+        if multi_qty_alerts:
+            picklist_text += "\n\n! ! ! MULTI-QTY ALERTS ! ! !\n" + "\n".join(multi_qty_alerts)
+
+        with open(out_txt_path, "w", encoding="utf-8") as f:
+            f.write(picklist_text)
+
+        # 2. Build Reordered PDF
+        reordered_indices = [it[5] for it in all_reordered]
+        pdf = pypdfium2.PdfDocument(pdf_source)
+        new_pdf = pypdfium2.PdfDocument.new()
+        new_pdf.import_pages(pdf, reordered_indices)
+        new_pdf.save(out_pdf_path)
+        new_pdf.close()
+        pdf.close()
+        del new_pdf
+        del pdf
+        gc.collect()
+
+        # 3. Update state
+        batch["last_courier"] = c_display_name
+
+        # 4. Summary Lines
+        c_pcs = sum(it[3] for it in courier_factory) + sum(it[3] for it in courier_at_home)
+        o_pcs = sum(it[3] for it in other_factory) + sum(it[3] for it in other_at_home)
+
+        summary_lines = [
+            f"🚚 *{c_display_name} Orders Extracted to Top!*\n",
+            f"• 🚚 *{c_display_name} Total:* {c_pcs} pcs ({total_c_labels} labels) -> *Pages 1 to {total_c_labels}*",
+        ]
+
+        if n_ca > 0:
+            c_tail_start = n_cf + 1
+            c_tail_end = total_c_labels
+            summary_lines.append(
+                f"   └─ 🏭 *Factory:* {sum(it[3] for it in courier_factory)} pcs (Pages 1 to {n_cf})\n"
+                f"   └─ 🏠 *At-Home:* {sum(it[3] for it in courier_at_home)} pcs (Pages {c_tail_start} to {c_tail_end} at END of {c_display_name}!)"
+            )
+
+        if total_o_labels := (n_of + n_oa):
+            start_o = total_c_labels + 1
+            end_o = total_c_labels + total_o_labels
+            summary_lines.append(f"• 📦 *Remaining Orders:* {o_pcs} pcs ({total_o_labels} labels) -> *Pages {start_o} to {end_o}*")
+
+            if n_oa > 0:
+                o_tail_start = total_c_labels + n_of + n_anom + 1
+                o_tail_end = len(all_reordered)
+                summary_lines.append(
+                    f"   └─ 🏠 *Other At-Home:* {sum(it[3] for it in other_at_home)} pcs (Pages {o_tail_start} to {o_tail_end} at VERY END of PDF)"
+                )
+
+        if n_ca > 0:
+            summary_lines.append(
+                f"\n💡 *How to pack:* Grab the top *{c_display_name}* stack (Pages 1 to {total_c_labels}). "
+                f"Peel off the **LAST {n_ca} label(s)** (Pages {n_cf+1} to {total_c_labels}) for your at-home stock!"
+            )
+        else:
+            summary_lines.append(
+                f"\n💡 *How to pack:* All *{c_display_name}* labels are printed FIRST at the top of the stack (Pages 1 to {total_c_labels}) in clean organised order!"
+            )
+
+        bot.send_message(chat_id, "\n".join(summary_lines), reply_to_message_id=msg_id)
+
+        # Send preview in chat if under Telegram length limit
+        if len(picklist_text) <= 3800:
+            bot.send_message(chat_id, f"📋 *Separated Picklist:*\n\n```\n{picklist_text}\n```")
+
+        # Send TXT Document
+        bot.send_document(
+            chat_id,
+            out_txt_path,
+            caption=f"📄 Picklist: {c_display_name} ({c_pcs} pcs) + Others ({o_pcs} pcs)"
+        )
+
+        # Send PDF Document
+        tail_caption = f" | {c_display_name} at-home at tail of block" if n_ca > 0 else ""
+        bot.send_document(
+            chat_id,
+            out_pdf_path,
+            caption=f"📑 Separated PDF: {c_display_name} (Pages 1 to {total_c_labels}) on top{tail_caption}"
+        )
+
+
+# ── Picklist Adjustment Handler (At-Home Stock) ────────────────────────
 
 def handle_adjustment(bot, chat_id, msg_id, edited_text):
     batch = user_last_batch.get(chat_id)
@@ -410,8 +907,8 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
         )
         return
 
-    target_counts = parse_edited_picklist(edited_text)
-    if not target_counts:
+    section_targets = parse_edited_picklist_sections(edited_text)
+    if not section_targets or not any(section_targets.values()):
         bot.send_message(
             chat_id,
             "⚠️ Could not parse any quantities from your text.\n"
@@ -421,32 +918,12 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
         return
 
     known = batch["known"]
-    anomalies = batch["anomalies"]
+    anomalies = batch.get("anomalies", [])
     pdf_source = batch["pdf_path"]
+    last_courier = batch.get("last_courier")
 
-    # Partition into Factory Labels vs Deducted / At-Home Labels
-    groups = defaultdict(list)
-    for it in known:
-        t, c, s, q, is_anom, orig_idx, raw = it
-        groups[(t, s, c.lower())].append(it)
-
-    factory_items = []
-    deducted_items = []
-
-    for key, label_list in groups.items():
-        t, s, c_lower = key
-        original_qty = sum(it[3] for it in label_list)
-        # Default to original_qty if not mentioned in the user's edit
-        desired_qty = target_counts.get(key, original_qty)
-
-        kept_qty = 0
-        for it in label_list:
-            lbl_qty = it[3]
-            if kept_qty + lbl_qty <= desired_qty:
-                factory_items.append(it)
-                kept_qty += lbl_qty
-            else:
-                deducted_items.append(it)
+    # Partition labels into factory_items vs deducted_items (respecting section edits)
+    factory_items, deducted_items = partition_labels_by_targets(known, section_targets, target_courier=last_courier)
 
     if not deducted_items:
         bot.send_message(
@@ -457,18 +934,26 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
         )
         return
 
+    # Update state
+    batch["factory_items"] = factory_items
+    batch["tail_items"] = deducted_items
+
+    # If user had courier split active, rebuild with courier split and at-home labels at end of courier!
+    if last_courier:
+        handle_courier_split(bot, chat_id, msg_id, last_courier)
+        return
+
+    # Standard adjustment (without courier split)
     bot.send_chat_action(chat_id, "upload_document")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_pdf_path = os.path.join(tmp_dir, "meesho_adjusted.pdf")
         out_txt_path = os.path.join(tmp_dir, "meesho_factory_picklist.txt")
 
-        # 1. Build New Factory Picklist Text
         new_picklist_text = build_picklist_text(factory_items, anomalies, tail_items=deducted_items)
         with open(out_txt_path, "w", encoding="utf-8") as f:
             f.write(new_picklist_text)
 
-        # 2. Reorder PDF: Factory Labels -> Anomalies -> Deducted / At-Home Labels at the tail!
         all_reordered = factory_items + anomalies + deducted_items
         reordered_indices = [it[5] for it in all_reordered]
 
@@ -478,8 +963,10 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
         new_pdf.save(out_pdf_path)
         new_pdf.close()
         pdf.close()
+        del new_pdf
+        del pdf
+        gc.collect()
 
-        # Summarize deducted pieces
         start_tail = len(factory_items) + len(anomalies) + 1
         end_tail = len(all_reordered)
 
@@ -496,28 +983,91 @@ def handle_adjustment(bot, chat_id, msg_id, edited_text):
             summary_lines.append(f"   • `{desc}`: *{cnt} pcs*")
 
         summary_lines.append(
-            f"\n💡 *How to pack:* The printer outputs all labels together. "
-            f"Simply grab the *LAST {len(deducted_items)} label(s)* from the bottom/tail of the printed stack for your at-home stock!"
+            f"\n💡 *How to pack:* Grab the *LAST {len(deducted_items)} label(s)* from the bottom/tail of the printed stack for your at-home stock!"
         )
 
         bot.send_message(chat_id, "\n".join(summary_lines), reply_to_message_id=msg_id)
 
-        # Send New Factory Picklist preview in chat
         if len(new_picklist_text) <= 3800:
             bot.send_message(chat_id, f"📋 *New Factory Picklist:*\n\n```\n{new_picklist_text}\n```")
 
-        # Send TXT Document
         bot.send_document(
             chat_id,
             out_txt_path,
             caption=f"📄 Factory Picklist: {len(factory_items)} pcs to pick"
         )
 
-        # Send Adjusted PDF
         bot.send_document(
             chat_id,
             out_pdf_path,
             caption=f"📑 Adjusted PDF: {len(all_reordered)} pages (At-Home stock at Pages {start_tail}-{end_tail})"
+        )
+
+
+def handle_reset_courier(bot, chat_id, msg_id):
+    """Resets courier separation back to all combined orders."""
+    batch = user_last_batch.get(chat_id)
+    if not batch or not os.path.exists(batch["pdf_path"]):
+        bot.send_message(
+            chat_id,
+            "⚠️ No previous PDF found in memory!\nPlease send your Meesho PDF first.",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    batch["last_courier"] = None
+    pdf_source = batch["pdf_path"]
+    anomalies = batch.get("anomalies", [])
+    tail_items = batch.get("tail_items", [])
+    active_items = batch.get("factory_items") if batch.get("factory_items") is not None else batch["known"]
+
+    def sort_key(it):
+        t, c, s, qty, *_ = it
+        return (t.lower(), SIZE_ORDER.get(s, 99), c.lower())
+
+    active_items.sort(key=sort_key)
+
+    bot.send_chat_action(chat_id, "upload_document")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_pdf_path = os.path.join(tmp_dir, "meesho_rearranged.pdf")
+        out_txt_path = os.path.join(tmp_dir, "meesho_picklist.txt")
+
+        picklist_text = build_picklist_text(active_items, anomalies, tail_items=tail_items)
+        all_reordered = active_items + anomalies + tail_items
+
+        with open(out_txt_path, "w", encoding="utf-8") as f:
+            f.write(picklist_text)
+
+        reordered_indices = [it[5] for it in all_reordered]
+        pdf = pypdfium2.PdfDocument(pdf_source)
+        new_pdf = pypdfium2.PdfDocument.new()
+        new_pdf.import_pages(pdf, reordered_indices)
+        new_pdf.save(out_pdf_path)
+        new_pdf.close()
+        pdf.close()
+        del new_pdf
+        del pdf
+        gc.collect()
+
+        bot.send_message(
+            chat_id,
+            f"🔄 *Reset to All Couriers Combined!*\nTotal orders: {len(active_items)} pcs",
+            reply_to_message_id=msg_id
+        )
+
+        if len(picklist_text) <= 3800:
+            bot.send_message(chat_id, f"📋 *Combined Picklist:*\n\n```\n{picklist_text}\n```")
+
+        bot.send_document(
+            chat_id,
+            out_txt_path,
+            caption=f"📄 Picklist: {len(active_items)} orders"
+        )
+        bot.send_document(
+            chat_id,
+            out_pdf_path,
+            caption=f"📑 Rearranged PDF: {len(all_reordered)} pages"
         )
 
 
@@ -537,15 +1087,21 @@ def process_single_message(bot, item):
     if text in ("/start", "/help"):
         mode = user_modes.get(chat_id, "both")
         welcome = (
-            "👋 *Meesho Label & Picklist Bot*\n\n"
+            "👋 *Meesho Label, Picklist & Courier Bot*\n\n"
             "📄 *Send a PDF:* Generates clean Picklist + Rearranged PDF.\n\n"
             "✂️ *Adjust for At-Home Stock:*\n"
-            "Already have some pieces in stock? Use `/adjust`!\n"
-            "1. Copy the picklist text.\n"
-            "2. Change the numbers of the items you have at home.\n"
-            "3. Send `/adjust` with the text (or just send the text).\n"
-            "👉 *The bot will move your at-home pieces to the VERY END (TAIL) of the PDF*, "
-            "so you can easily grab the tail of the printed stack!\n\n"
+            "Use `/adjust` to cut off stock you have at home.\n\n"
+            "🚚 *Courier Partner Extraction:*\n"
+            "Extract any courier company to the **TOP of the stack** in organised order:\n"
+            "• `/ex` or `/xb` - Xpressbees on top\n"
+            "• `/del` or `/delhivery` - Delhivery on top\n"
+            "• `/sf` or `/shadowfax` - Shadowfax on top\n"
+            "• `/vl` or `/valmo` - Valmo on top\n"
+            "• `/courier` - View all couriers in batch\n"
+            "• `/all` - Reset to all couriers combined\n\n"
+            "💡 *Smart At-Home Tail Placement:*\n"
+            "When extracting a courier (e.g. `/ex`), any at-home pieces for that courier are placed "
+            "**at the very end of that courier's stack** so you can grab them off immediately!\n\n"
             f"⚙️ *Current Mode:* `{mode.upper()}`\n"
             "• `/both` - Picklist TXT + Rearranged PDF (default)\n"
             "• `/txt`  - Picklist TXT only"
@@ -574,9 +1130,26 @@ def process_single_message(bot, item):
                 "✏️ *Ready to Adjust Picklist!*\n\n"
                 "Please copy the previous picklist message, edit the numbers of the stock you have at home, "
                 "and paste it here.\n\n"
-                "*(Tip: You can paste the whole picklist or just the lines you changed, e.g. `P XL Maroon 2`)*",
+                "*(Tip: You can paste the whole picklist or just the lines you changed, e.g. `P XL Maroon - 2`)*",
                 reply_to_message_id=msg_id
             )
+        return
+
+    # Check for Courier Split commands (/ex, /xb, /del, /sf, /vl, /courier)
+    cmd = text.split()[0].lower() if text else ""
+    if cmd in COURIER_CMD_MAP:
+        target_courier = COURIER_CMD_MAP[cmd]
+        handle_courier_split(bot, chat_id, msg_id, target_courier)
+        return
+
+    if cmd in ("/courier", "/couriers"):
+        parts = text.split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else ""
+        handle_courier_split(bot, chat_id, msg_id, target)
+        return
+
+    if cmd in ("/all", "/reset", "/reset_courier"):
+        handle_reset_courier(bot, chat_id, msg_id)
         return
 
     # Check if user was waiting to send adjustment text OR if message looks like a picklist
@@ -643,7 +1216,7 @@ def process_single_message(bot, item):
                     with open(local_out_txt, "w", encoding="utf-8") as f:
                         f.write(picklist_text)
 
-                    # Save to persistent user cache for /adjust command
+                    # Save to persistent user cache for /adjust and courier commands
                     cache_dir = os.path.join(tempfile.gettempdir(), "meesho_bot_cache")
                     os.makedirs(cache_dir, exist_ok=True)
                     cached_pdf_path = os.path.join(cache_dir, f"batch_{chat_id}.pdf")
@@ -654,6 +1227,9 @@ def process_single_message(bot, item):
                         "known": known,
                         "anomalies": anomalies,
                         "total_pages": total_pages,
+                        "factory_items": known,
+                        "tail_items": [],
+                        "last_courier": None,
                         "timestamp": time.time()
                     }
 
@@ -681,12 +1257,24 @@ def process_single_message(bot, item):
                             caption=f"📑 Rearranged PDF: {total_pages} pages sorted{alert_note}"
                         )
 
-                    # 4. Helpful tip about adjusting
-                    bot.send_message(
-                        chat_id,
-                        "💡 *Tip:* Have some of these pieces in stock at home?\n"
-                        "Send `/adjust` to deduct them and move their labels to the very tail of the PDF!"
+                    # 4. Courier Breakdown & Helpful Tips
+                    courier_counts = defaultdict(int)
+                    for it in known:
+                        cname = it[7] if len(it) > 7 else "Other"
+                        courier_counts[cname] += it[3]
+
+                    courier_summary = ", ".join(f"{c}: {cnt}" for c, cnt in sorted(courier_counts.items(), key=lambda x: -x[1]))
+
+                    tips = (
+                        f"🚚 *Couriers in batch:* {courier_summary}\n\n"
+                        "💡 *Quick Commands:*\n"
+                        "• `/ex` - Put Xpressbees orders on top\n"
+                        "• `/del` - Put Delhivery orders on top\n"
+                        "• `/sf` - Put Shadowfax orders on top\n"
+                        "• `/vl` - Put Valmo orders on top\n"
+                        "• `/adjust` - Move at-home stock to tail of PDF"
                     )
+                    bot.send_message(chat_id, tips)
 
                 except Exception as e:
                     bot.send_message(chat_id, f"❌ Error processing PDF: {e}", reply_to_message_id=msg_id)
@@ -740,7 +1328,10 @@ def main():
     print("=" * 60)
     print("  Meesho Telegram Bot is running!")
     print("  Engine: pypdfium2 (~2MB RAM, ultra-fast).")
-    print("  Feature: /adjust (At-Home stock moved to PDF tail).")
+    print("  Features:")
+    print("    • /adjust (Move at-home pieces to PDF tail)")
+    print("    • /ex, /del, /sf, /vl (Courier partner extraction to top)")
+    print("    • Courier At-Home labels at end of courier stack!")
     print("=" * 60)
 
     while True:
