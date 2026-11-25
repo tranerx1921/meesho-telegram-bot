@@ -31,6 +31,7 @@ import socketserver
 import requests
 from collections import defaultdict
 import pypdfium2
+import pypdfium2.raw as pdfium_c
 
 # ── Configuration ──────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -597,6 +598,510 @@ def process_initial_pdf(input_pdf_path, output_pdf_path, check_cancelled):
     return picklist_text, len(ordered), len(multi_qty_alerts), known, anomalies
 
 
+# ── Flipkart PDF Processor Engine (pypdfium2 Ultra-Low RAM) ─────────────
+
+FK_SIZE_ORDER = {"M": 0, "L": 1, "XL": 2, "2XL": 3, "3XL": 4}
+FK_SIZE_LIST = ["M", "L", "XL", "2XL", "3XL"]
+FK_KNOWN_SIZES = set(FK_SIZE_ORDER.keys()) | {"XXL", "XXXL"}
+FK_LABEL_WIDTH = 213.0   # ~75mm / 3 inch
+FK_LABEL_HEIGHT = 354.0  # ~125mm / 5 inch
+
+FK_PRODUCT_PREFIXES = [
+    "Full Plain",
+    "Half-P",
+    "50 Full",
+    "Single Full",
+    "Half Plain",
+    "50 Half",
+    "Single Half",
+]
+
+FK_FULL_PLAIN_NEW_COLOURS = {
+    "Blue", "Coffee", "Pink", "Red", "Mustard", "Sea"
+}
+
+FK_TYPE_ORDER = {
+    "Full Plain": 0, "Full Plain New": 1,
+    "Half-P": 2, "50 Full": 3, "Single Full": 4,
+    "Half Plain": 5, "50 Half": 6, "Single Half": 7
+}
+
+FK_ALL_TYPES = [
+    "Full Plain New", "Full Plain", "Half-P", "50 Full",
+    "Single Full", "Half Plain", "50 Half", "Single Half", "Unknown"
+]
+
+
+def fk_normalize_size(raw):
+    s = raw.strip().upper()
+    if s == "XXXL":
+        return "3XL"
+    if s == "XXL":
+        return "2XL"
+    return s
+
+
+def fk_normalize_colour(raw):
+    s = raw.strip().title()
+    colour_aliases = {
+        "Biege": "Biege",
+        "Beige": "Biege",
+        "L Biege": "Biege",
+        "L Beige": "Biege",
+        "Lbiege": "Biege",
+        "Lbeige": "Biege",
+        "Light Biege": "Biege",
+        "Light Beige": "Biege",
+        "Lblue": "Light Blue",
+        "D Coffee": "Coffee",
+    }
+    return colour_aliases.get(s, s)
+
+
+def fk_parse_sku_description(desc):
+    desc = desc.strip()
+    if not desc:
+        return None
+    tokens = desc.split()
+    if not tokens:
+        return None
+    raw_size = tokens[-1].upper()
+    if raw_size not in FK_KNOWN_SIZES:
+        return None
+    size = fk_normalize_size(raw_size)
+    remainder = " ".join(tokens[:-1])
+    for prefix in FK_PRODUCT_PREFIXES:
+        if remainder.lower().startswith(prefix.lower()):
+            colour = remainder[len(prefix):].strip()
+            return (prefix, fk_normalize_colour(colour) if colour else "N/A", size)
+    return ("Unknown", fk_normalize_colour(remainder) if remainder else "N/A", size)
+
+
+def fk_extract_sku_items_from_page(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    items = []
+    in_sku = False
+    for line in lines:
+        if "SKU ID" in line:
+            in_sku = True
+            continue
+        if not in_sku:
+            continue
+        stripped = line.strip()
+        if stripped == "QTY":
+            continue
+        if stripped.isdigit() and len(stripped) <= 2:
+            continue
+        if re.match(r"^(FM|SF|\d{10,})", stripped):
+            in_sku = False
+            continue
+        if not stripped:
+            in_sku = False
+            continue
+        m = re.match(r"^\d+\s+(.+?)(?:\s*\|\s*(.+))?$", stripped)
+        if m:
+            sku_desc = m.group(1).strip()
+            parsed = fk_parse_sku_description(sku_desc)
+            if parsed:
+                items.append(parsed)
+    return items
+
+
+def fk_extract_barcode(text):
+    m_awb = re.search(r"A\s*WB\s*No\.?\s*([A-Za-z0-9]+)", text)
+    if m_awb:
+        return m_awb.group(1).strip()
+    m_fm = re.search(r"\b(FM[A-Za-z0-9]{8,15})\b", text)
+    if m_fm:
+        return m_fm.group(1).strip()
+    m_sf = re.search(r"\b(SF[A-Za-z0-9]{8,15})\b", text)
+    if m_sf:
+        return m_sf.group(1).strip()
+    m_od = re.search(r"\b(OD\d{16,20})\b", text)
+    if m_od:
+        return m_od.group(1).strip()
+    return None
+
+
+def is_flipkart_pdf(input_pdf_path):
+    """Detects whether a PDF contains Flipkart shipping labels."""
+    try:
+        doc = pypdfium2.PdfDocument(input_pdf_path)
+        pages_to_check = min(5, len(doc))
+        for i in range(pages_to_check):
+            pg = doc[i]
+            tp = pg.get_textpage()
+            txt = tp.get_text_range().replace("\r\n", "\n")
+            tp.close()
+            pg.close()
+            if "SKU ID" in txt and (
+                "Ordered through" in txt
+                or "E-Kart" in txt
+                or "HBD:" in txt
+                or "Use Transparent Packaging" in txt
+                or re.search(r"\b(OD\d{16,20}|FM[A-Za-z0-9]{8,15})\b", txt)
+            ):
+                doc.close()
+                return True
+        doc.close()
+    except Exception:
+        pass
+    return False
+
+
+def _fk_get_label_crop_rect_pdfium(page):
+    """Auto-detects outer border line of a Flipkart label in PDFium bottom-up coordinates."""
+    pw, ph = page.get_size()
+    h_lines = []
+    v_lines = []
+    for obj in page.get_objects(max_depth=1):
+        if obj.type == pdfium_c.FPDF_PAGEOBJ_PATH:
+            l, b, r, t = obj.get_bounds()
+            w = r - l
+            h = t - b
+            if w > 150 and h < 3:
+                h_lines.append((l, b, r, t))
+            if h > 250 and w < 3:
+                v_lines.append((l, b, r, t))
+    if h_lines and v_lines:
+        cx0 = max(0.0, min(x[0] for x in v_lines) - 1.0)
+        cx1 = min(pw, max(x[2] for x in v_lines) + 1.0)
+        cb0 = max(0.0, min(x[1] for x in h_lines) - 1.0)
+        ct1 = min(ph + 1.0, max(x[3] for x in h_lines) + 1.0)
+        return (cx0, cb0, cx1, ct1)
+
+    if pw < 300:
+        return (7.0, max(0.0, ph - 340.0), min(211.5, pw), ph)
+    return (190.5, max(0.0, ph - 381.0), 404.2, max(0.0, ph - 28.5))
+
+
+def build_flipkart_cropped_pdf(src_pdf_path, ordered_indices, out_pdf_path, check_cancelled=None):
+    """Builds 3x5 inch (213x354) tightly border-cropped Flipkart output PDF using ~2-45MB RAM."""
+    src_doc = pypdfium2.PdfDocument(src_pdf_path)
+    new_pdf = pypdfium2.PdfDocument.new()
+    new_pdf.import_pages(src_doc, ordered_indices)
+    src_doc.close()
+    del src_doc
+    gc.collect()
+
+    n_out = len(new_pdf)
+    for i in range(n_out):
+        if check_cancelled and check_cancelled():
+            new_pdf.close()
+            del new_pdf
+            gc.collect()
+            return False
+
+        pg = new_pdf[i]
+        cx0, cb0, cx1, ct1 = _fk_get_label_crop_rect_pdfium(pg)
+        cw = max(1.0, cx1 - cx0)
+        ch = max(1.0, ct1 - cb0)
+        scale = min(FK_LABEL_WIDTH / cw, FK_LABEL_HEIGHT / ch)
+        x_dst = (FK_LABEL_WIDTH - cw * scale) / 2.0
+        y_dst = (FK_LABEL_HEIGHT - ch * scale) / 2.0
+        dx = x_dst - cx0 * scale
+        dy = y_dst - cb0 * scale
+
+        mat = pdfium_c.FS_MATRIX(scale, 0.0, 0.0, scale, dx, dy)
+        clip = pdfium_c.FS_RECTF(
+            x_dst - 0.5,
+            y_dst + ch * scale + 0.5,
+            x_dst + cw * scale + 0.5,
+            y_dst - 0.5
+        )
+        pdfium_c.FPDFPage_TransFormWithClip(pg.raw, mat, clip)
+        pg.set_mediabox(0.0, 0.0, FK_LABEL_WIDTH, FK_LABEL_HEIGHT)
+        pg.set_cropbox(0.0, 0.0, FK_LABEL_WIDTH, FK_LABEL_HEIGHT)
+        pg.gen_content()
+        pg.close()
+
+    new_pdf.save(out_pdf_path)
+    new_pdf.close()
+    del new_pdf
+    gc.collect()
+    return True
+
+
+def build_flipkart_picklist_text(singles, combos, anomalies=None, duplicates_skipped=None, tail_singles=None):
+    """Generates exact Flipkart Colour-first / Size-second tree picklist (+ optional At-Home tail summary)."""
+    lines = []
+    separator = "─" * 48
+
+    picklist_data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    for t, c, s, *_ in singles:
+        picklist_data[t][c][s] += 1
+    for c_items, *_ in combos:
+        for t, c, s in c_items:
+            picklist_data[t][c][s] += 1
+
+    type_display = sorted(picklist_data.keys(), key=lambda t: FK_TYPE_ORDER.get(t, 99))
+
+    for ttype in type_display:
+        lines.append(separator)
+        lines.append(f"  {ttype.upper()}")
+        lines.append(separator)
+
+        type_total = sum(sum(sz_d.values()) for sz_d in picklist_data[ttype].values())
+        lines.append(f"  Total items: {type_total}")
+        lines.append("")
+
+        sorted_colours = sorted(picklist_data[ttype].keys(), key=lambda x: x.lower())
+        for colour in sorted_colours:
+            sizes_dict = picklist_data[ttype][colour]
+            colour_total = sum(sizes_dict.values())
+            lines.append(f"  ┌─ {colour} ({colour_total} pcs)")
+
+            avail_sizes = [sz for sz in FK_SIZE_LIST if sz in sizes_dict]
+            for i, sz in enumerate(avail_sizes):
+                cnt = sizes_dict[sz]
+                is_last = (i == len(avail_sizes) - 1)
+                branch = "└──" if is_last else "├──"
+                lines.append(f"  │  {branch} {sz:<14} × {cnt}")
+
+            lines.append("  │")
+
+        lines.append("")
+
+    total_combo_pieces = sum(len(c[0]) for c in combos)
+    anom_count = len(anomalies) if anomalies else 0
+    dups_count = len(duplicates_skipped) if duplicates_skipped else 0
+
+    lines.append(separator)
+    grand_total_pieces = len(singles) + total_combo_pieces + anom_count
+    total_bags = len(singles) + len(combos) + anom_count
+    if dups_count:
+        lines.append(f"  DUPLICATES SKIPPED  : {dups_count} (duplicate barcodes filtered out)")
+    if anomalies:
+        lines.append(f"  ANOMALIES           : {anom_count}")
+        for a in anomalies:
+            lines.append(f"    • {a[1]}")
+    lines.append(f"  GRAND TOTAL PIECES  : {grand_total_pieces}")
+    lines.append(f"  TOTAL LABELS / BAGS : {total_bags}")
+    lines.append(separator)
+
+    if tail_singles:
+        start_tail = total_bags + 1
+        end_tail = total_bags + len(tail_singles)
+        lines.append("")
+        lines.append("=" * 48)
+        lines.append(f"🏠 AT-HOME / TAIL LABELS: {len(tail_singles)} pcs")
+        lines.append(f"(Pages {start_tail} to {end_tail} at the VERY END of PDF)")
+        lines.append("=" * 48)
+        tail_summary = defaultdict(int)
+        for t, c, s, *_ in tail_singles:
+            tail_summary[f"{t} {c} {s}"] += 1
+        for desc, cnt in sorted(tail_summary.items()):
+            lines.append(f"   • {desc:<28} {cnt} pcs")
+
+    return "\n".join(lines)
+
+
+def parse_flipkart_user_picklist(text):
+    """
+    Parses edited Flipkart picklist (full copied tree, partial block, or inline shorthand).
+    Returns {(type, colour, size): desired_qty}.
+    """
+    targets = {}
+    current_type = None
+    current_colour = None
+    type_lookup = {t.lower(): t for t in FK_ALL_TYPES}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "AT-HOME" in line.upper() or line.startswith("🏠"):
+            break
+
+        if set(line) <= {"─", "-", "=", " "}:
+            continue
+        lower = line.lower()
+        if any(lower.startswith(p) for p in ("total items:", "grand total", "total labels", "duplicates skipped", "anomalies", "!", "*")):
+            continue
+
+        cleaned = re.sub(r"[│├└┌]+", " ", line).strip()
+        cleaned = re.sub(r"^[─\-]+\s*", "", cleaned).strip()
+        if not cleaned:
+            continue
+
+        if cleaned.lower() in type_lookup:
+            current_type = type_lookup[cleaned.lower()]
+            current_colour = None
+            continue
+
+        matched_inline = False
+        for tname in FK_ALL_TYPES:
+            if cleaned.lower().startswith(tname.lower() + " "):
+                rest = cleaned[len(tname):].strip()
+                m_in = re.match(r"^(.+?)\s+(3XL|2XL|XXXL|XXL|XL|L|M)[\s×xX*\-:]+(\d+)\s*$", rest, re.I)
+                if m_in:
+                    col = fk_normalize_colour(m_in.group(1))
+                    sz = fk_normalize_size(m_in.group(2))
+                    qty = int(m_in.group(3))
+                    targets[(tname, col, sz)] = qty
+                    matched_inline = True
+                    break
+        if matched_inline:
+            continue
+
+        m_sq = re.match(r"^(3XL|2XL|XXXL|XXL|XL|L|M)[\s×xX*\-:]+(\d+)\s*$", cleaned, re.I)
+        if m_sq and current_type and current_colour:
+            sz = fk_normalize_size(m_sq.group(1))
+            qty = int(m_sq.group(2))
+            targets[(current_type, current_colour, sz)] = qty
+            continue
+
+        if line.lstrip().startswith(("┌", "+")) or ("pcs)" in cleaned.lower()):
+            col_name = re.sub(r"\(\s*\d+\s*(?:pcs?)?\s*\)$", "", cleaned, flags=re.I).strip()
+            if col_name:
+                current_colour = fk_normalize_colour(col_name)
+                continue
+
+        if current_type and not re.search(r"\d", cleaned):
+            current_colour = fk_normalize_colour(cleaned)
+
+    return targets
+
+
+def partition_flipkart_labels(known_singles, combos, targets):
+    """
+    Separates Flipkart singles into factory_singles vs tail_singles (at-home stock).
+    Accounts for pieces already inside combos so deductions match total picklist counts.
+    """
+    combo_counts = defaultdict(int)
+    for c_items, *_ in combos:
+        for t, c, s in c_items:
+            combo_counts[(t, c.lower(), s)] += 1
+
+    single_groups = defaultdict(list)
+    for it in known_singles:
+        t, c, s, *_ = it
+        single_groups[(t, c.lower(), s)].append(it)
+
+    all_keys = set(single_groups.keys()) | set(combo_counts.keys())
+    norm_targets = {(t, c.lower(), s): q for (t, c, s), q in targets.items()}
+
+    factory_singles = []
+    tail_singles = []
+    locked_warnings = []
+
+    for key in all_keys:
+        s_list = single_groups.get(key, [])
+        c_cnt = combo_counts.get(key, 0)
+        orig_total = len(s_list) + c_cnt
+
+        desired_total = norm_targets.get(key, orig_total)
+        to_deduct = max(0, orig_total - desired_total)
+
+        deduct_from_singles = min(to_deduct, len(s_list))
+        if to_deduct > len(s_list):
+            t, c_low, s = key
+            locked_warnings.append(f"{t} {c_low.title()} {s}: {to_deduct - len(s_list)} pc(s) inside combo order(s)")
+
+        keep_count = len(s_list) - deduct_from_singles
+        factory_singles.extend(s_list[:keep_count])
+        tail_singles.extend(s_list[keep_count:])
+
+    def single_sort_key(item):
+        t, c, s, *_ = item
+        return (FK_TYPE_ORDER.get(t, 99), c.lower(), FK_SIZE_ORDER.get(s, 99))
+
+    factory_singles.sort(key=single_sort_key)
+    tail_singles.sort(key=single_sort_key)
+    return factory_singles, tail_singles, locked_warnings
+
+
+def process_flipkart_pdf(input_pdf_path, output_pdf_path, check_cancelled, source_filename="labels.pdf"):
+    """Full Flipkart PDF processing (matching flipkart_sorter.py) on ultra-low RAM pypdfium2."""
+    doc = pypdfium2.PdfDocument(input_pdf_path)
+    n = len(doc)
+
+    singles = []    # (ttype, colour, size, page_idx)
+    combos = []     # (norm_items, page_idx)
+    anomalies = []  # ("ANOMALY", label, "", page_idx)
+    seen_barcodes = {}
+    duplicates_skipped = []
+
+    for idx in range(n):
+        if check_cancelled():
+            doc.close()
+            return None
+
+        pg = doc[idx]
+        tp = pg.get_textpage()
+        text = tp.get_text_range().replace("\r\n", "\n").replace("\r", "\n")
+        tp.close()
+        pg.close()
+
+        barcode = fk_extract_barcode(text)
+        if barcode:
+            if barcode in seen_barcodes:
+                orig_pg = seen_barcodes[barcode]
+                duplicates_skipped.append((barcode, source_filename, idx + 1, source_filename, orig_pg))
+                continue
+            seen_barcodes[barcode] = idx + 1
+
+        sku_items = fk_extract_sku_items_from_page(text)
+        if not sku_items:
+            anomalies.append(("ANOMALY", f"UNKNOWN_{source_filename}_p{idx+1}", "", idx))
+            continue
+
+        norm_items = []
+        for ttype, colour, size in sku_items:
+            if ttype == "Full Plain" and colour in FK_FULL_PLAIN_NEW_COLOURS:
+                ttype = "Full Plain New"
+            norm_items.append((ttype, colour, size))
+
+        if len(norm_items) == 1:
+            t, c, s = norm_items[0]
+            singles.append((t, c, s, idx))
+        else:
+            combos.append((norm_items, idx))
+
+    doc.close()
+    del doc
+    gc.collect()
+
+    if check_cancelled():
+        return None
+
+    def single_sort_key(item):
+        t, c, s, *_ = item
+        return (FK_TYPE_ORDER.get(t, 99), c.lower(), FK_SIZE_ORDER.get(s, 99))
+
+    def combo_sort_key(c_item):
+        items_list, _ = c_item
+        t, c, s = items_list[0]
+        return (-len(items_list), FK_TYPE_ORDER.get(t, 99), c.lower(), FK_SIZE_ORDER.get(s, 99))
+
+    singles.sort(key=single_sort_key)
+    anomalies.sort(key=lambda x: x[1].lower())
+    combos.sort(key=combo_sort_key)
+
+    picklist_text = build_flipkart_picklist_text(singles, combos, anomalies, duplicates_skipped)
+
+    ordered_indices = (
+        [it[3] for it in singles]
+        + [c[1] for c in combos]
+        + [a[3] for a in anomalies]
+    )
+
+    ok = build_flipkart_cropped_pdf(input_pdf_path, ordered_indices, output_pdf_path, check_cancelled)
+    if not ok:
+        return None
+
+    return {
+        "picklist_text": picklist_text,
+        "singles": singles,
+        "combos": combos,
+        "anomalies": anomalies,
+        "duplicates_skipped": duplicates_skipped,
+        "total_bags": len(ordered_indices),
+        "grand_total_pieces": len(singles) + sum(len(c[0]) for c in combos) + len(anomalies),
+    }
+
+
 # ── Telegram API Client ────────────────────────────────────────────────
 
 class TelegramBot:
@@ -668,10 +1173,12 @@ class TelegramBot:
 
     def download_file(self, server_path, local_destination):
         url = f"https://api.telegram.org/file/bot{self.token}/{server_path}"
-        r = requests.get(url, stream=True, timeout=90)
-        with open(local_destination, "wb") as f:
-            for chunk in r.iter_content(chunk_size=16384):
-                f.write(chunk)
+        with requests.get(url, stream=True, timeout=90) as r:
+            r.raise_for_status()
+            with open(local_destination, "wb") as f:
+                for chunk in r.iter_content(chunk_size=16384):
+                    if chunk:
+                        f.write(chunk)
 
     def delete_webhook(self, drop_pending=True):
         url = f"{self.base_url}/deleteWebhook"
@@ -693,6 +1200,33 @@ class TelegramBot:
             return None
 
 
+def send_picklist_messages(bot, chat_id, picklist_text, header_prefix="📋 *Picklist Generated*"):
+    """Sends picklist text in chat, splitting cleanly across section boundaries if > 3800 chars."""
+    if len(picklist_text) <= 3800:
+        bot.send_message(chat_id, f"{header_prefix}:\n\n```\n{picklist_text}\n```")
+        return
+
+    chunks = []
+    cur = []
+    cur_len = 0
+    for line in picklist_text.splitlines():
+        if cur and cur_len + len(line) + 1 > 3600:
+            chunks.append("\n".join(cur))
+            cur = [line]
+            cur_len = len(line) + 1
+        else:
+            cur.append(line)
+            cur_len += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+
+    for idx, ch in enumerate(chunks[:3]):
+        part_note = f" (Part {idx+1}/{len(chunks)})" if len(chunks) > 1 else ""
+        bot.send_message(chat_id, f"{header_prefix}{part_note}:\n\n```\n{ch}\n```")
+    if len(chunks) > 3:
+        bot.send_message(chat_id, "📄 Remaining picklist sections are in the attached file below.")
+
+
 # ── Courier Separation Handler (/ex, /del, /sf, /vl, /courier) ─────────
 
 def handle_courier_split(bot, chat_id, msg_id, target_courier):
@@ -701,7 +1235,16 @@ def handle_courier_split(bot, chat_id, msg_id, target_courier):
         bot.send_message(
             chat_id,
             "⚠️ No previous PDF found in memory!\n"
-            "Please send your Meesho PDF first, then you can extract courier orders.",
+            "Please send your PDF first.",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    if batch.get("platform") == "flipkart":
+        bot.send_message(
+            chat_id,
+            "ℹ️ Courier separation is only for Meesho batches (Flipkart uses a single courier).\n"
+            "You can still use `/adjust` to move at-home stock to the end of your Flipkart PDF!",
             reply_to_message_id=msg_id
         )
         return
@@ -897,14 +1440,123 @@ def handle_courier_split(bot, chat_id, msg_id, target_courier):
 
 # ── Picklist Adjustment Handler (At-Home Stock) ────────────────────────
 
+def handle_flipkart_adjustment(bot, chat_id, msg_id, edited_text):
+    batch = user_last_batch.get(chat_id)
+    if not batch or not os.path.exists(batch["pdf_path"]):
+        bot.send_message(
+            chat_id,
+            "⚠️ No previous Flipkart PDF found in memory!\nPlease send your Flipkart PDF first.",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    targets = parse_flipkart_user_picklist(edited_text)
+    if not targets:
+        bot.send_message(
+            chat_id,
+            "⚠️ Could not parse any Flipkart quantities from your text.\n"
+            "Please copy the previous picklist message, lower the numbers for at-home items (e.g. `× 4` -> `× 2`), and paste it here.",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    known_singles = batch["singles"]
+    combos = batch.get("combos", [])
+    anomalies = batch.get("anomalies", [])
+    dups = batch.get("duplicates_skipped", [])
+    pdf_source = batch["pdf_path"]
+
+    factory_singles, tail_singles, locked_warnings = partition_flipkart_labels(known_singles, combos, targets)
+
+    if not tail_singles:
+        bot.send_message(
+            chat_id,
+            "ℹ️ No items were deducted! The quantities you sent match or exceed the original batch.\n"
+            "To cut off at-home stock, lower the quantity of the item (e.g. from 4 to 2).",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    batch["factory_singles"] = factory_singles
+    batch["tail_singles"] = tail_singles
+
+    bot.send_chat_action(chat_id, "upload_document")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_pdf_path = os.path.join(tmp_dir, "rearranged_output.pdf")
+        out_txt_path = os.path.join(tmp_dir, "picklist.txt")
+
+        new_picklist_text = build_flipkart_picklist_text(
+            factory_singles, combos, anomalies, dups, tail_singles=tail_singles
+        )
+        with open(out_txt_path, "w", encoding="utf-8") as f:
+            f.write(new_picklist_text)
+
+        ordered_indices = (
+            [it[3] for it in factory_singles]
+            + [c[1] for c in combos]
+            + [a[3] for a in anomalies]
+            + [it[3] for it in tail_singles]
+        )
+
+        ok = build_flipkart_cropped_pdf(pdf_source, ordered_indices, out_pdf_path)
+        if not ok:
+            return
+
+        factory_bags = len(factory_singles) + len(combos)
+        start_tail = factory_bags + len(anomalies) + 1
+        end_tail = len(ordered_indices)
+
+        deducted_summary = defaultdict(int)
+        for t, c, s, *_ in tail_singles:
+            deducted_summary[f"{t} {c} {s}"] += 1
+
+        summary_lines = [
+            "✂️ *Flipkart Picklist & PDF Adjusted Successfully!*\n",
+            f"🏭 *Factory Labels:* {factory_bags} label(s) (Pages 1 to {factory_bags})",
+            f"🏠 *At-Home Stock (Tail):* {len(tail_singles)} label(s) (Pages {start_tail} to {end_tail})",
+        ]
+        for desc, cnt in sorted(deducted_summary.items()):
+            summary_lines.append(f"   • `{desc}`: *{cnt} pcs*")
+
+        if locked_warnings:
+            summary_lines.append("\n⚠️ *Combo Note (cannot split single piece inside multi-item combo order):*")
+            for w in locked_warnings:
+                summary_lines.append(f"   • {w}")
+
+        summary_lines.append(
+            f"\n💡 *How to pack:* Grab the *LAST {len(tail_singles)} label(s)* from the bottom/tail of the printed stack for your at-home stock!"
+        )
+
+        bot.send_message(chat_id, "\n".join(summary_lines), reply_to_message_id=msg_id)
+        send_picklist_messages(bot, chat_id, new_picklist_text, header_prefix="📋 *New Factory Picklist*")
+
+        bot.send_document(
+            chat_id,
+            out_txt_path,
+            caption=f"📄 Factory Picklist: {factory_bags} label(s) to pick"
+        )
+        mode = user_modes.get(chat_id, "both")
+        if mode == "both":
+            bot.send_document(
+                chat_id,
+                out_pdf_path,
+                caption=f"📑 Adjusted Flipkart PDF: {len(ordered_indices)} labels (3x5 cropped, At-Home tail Pages {start_tail}-{end_tail})"
+            )
+
+
 def handle_adjustment(bot, chat_id, msg_id, edited_text):
     batch = user_last_batch.get(chat_id)
     if not batch or not os.path.exists(batch["pdf_path"]):
         bot.send_message(
             chat_id,
-            "⚠️ No previous PDF found in memory!\nPlease send your Meesho PDF first, then you can adjust the picklist.",
+            "⚠️ No previous PDF found in memory!\nPlease send your PDF first, then you can adjust the picklist.",
             reply_to_message_id=msg_id
         )
+        return
+
+    if batch.get("platform") == "flipkart":
+        handle_flipkart_adjustment(bot, chat_id, msg_id, edited_text)
         return
 
     section_targets, global_targets = parse_user_picklist_robust(edited_text)
@@ -1010,7 +1662,15 @@ def handle_reset_courier(bot, chat_id, msg_id):
     if not batch or not os.path.exists(batch["pdf_path"]):
         bot.send_message(
             chat_id,
-            "⚠️ No previous PDF found in memory!\nPlease send your Meesho PDF first.",
+            "⚠️ No previous PDF found in memory!\nPlease send your PDF first.",
+            reply_to_message_id=msg_id
+        )
+        return
+
+    if batch.get("platform") == "flipkart":
+        bot.send_message(
+            chat_id,
+            "ℹ️ Flipkart batches use a single courier — no courier split active.",
             reply_to_message_id=msg_id
         )
         return
@@ -1215,11 +1875,11 @@ def process_single_message(bot, item):
     if text in ("/start", "/help"):
         mode = user_modes.get(chat_id, "both")
         welcome = (
-            "👋 *Meesho Label, Picklist & Courier Bot*\n\n"
-            "📄 *Send a PDF:* Generates clean Picklist + Rearranged PDF.\n\n"
+            "👋 *Meesho & Flipkart Label & Picklist Bot*\n\n"
+            "📄 *Send any Meesho or Flipkart PDF:* Auto-detects platform and generates Picklist + Sorted PDF (Flipkart labels auto-cropped to 3x5 inch).\n\n"
             "✂️ *Adjust for At-Home Stock:*\n"
-            "Use `/adjust` to cut off stock you have at home.\n\n"
-            "🚚 *Courier Partner Extraction:*\n"
+            "Use `/adjust` (or just paste the edited picklist) to cut off stock you have at home and move those labels to the tail of the PDF.\n\n"
+            "🚚 *Courier Partner Extraction (Meesho):*\n"
             "Extract any courier company to the **TOP of the stack** in organised order:\n"
             "• `/ex` or `/xb` - Xpressbees on top\n"
             "• `/del` or `/delhivery` - Delhivery on top\n"
@@ -1253,12 +1913,16 @@ def process_single_message(bot, item):
             handle_adjustment(bot, chat_id, msg_id, content)
         else:
             user_waiting_adjust.add(chat_id)
+            batch = user_last_batch.get(chat_id, {})
+            if batch.get("platform") == "flipkart":
+                hint = "*(Tip: Paste the edited picklist or lines like `Full Plain Maroon XL × 2`)*"
+            else:
+                hint = "*(Tip: You can paste the whole picklist or just the lines you changed, e.g. `P XL Maroon - 2`)*"
             bot.send_message(
                 chat_id,
                 "✏️ *Ready to Adjust Picklist!*\n\n"
                 "Please copy the previous picklist message, edit the numbers of the stock you have at home, "
-                "and paste it here.\n\n"
-                "*(Tip: You can paste the whole picklist or just the lines you changed, e.g. `P XL Maroon - 2`)*",
+                f"and paste it here.\n\n{hint}",
                 reply_to_message_id=msg_id
             )
         return
@@ -1294,8 +1958,18 @@ def process_single_message(bot, item):
         bot.send_message(chat_id, msg_text, reply_to_message_id=msg_id)
         return
 
-    # Check if user was waiting to send adjustment text OR if message looks like a picklist
-    if chat_id in user_waiting_adjust or ("[" in text and any(s in text.upper() for s in ("M", "L", "XL", "XXL", "XXXL"))):
+    # Check if user was waiting to send adjustment text OR if message looks like a Meesho/Flipkart picklist
+    cur_batch = user_last_batch.get(chat_id, {})
+    looks_like_meesho = "[" in text and any(s in text.upper() for s in ("M", "L", "XL", "XXL", "XXXL"))
+    looks_like_flipkart = (
+        cur_batch.get("platform") == "flipkart"
+        and any(s in text.upper() for s in ("M", "L", "XL", "2XL", "3XL"))
+        and (
+            any(sym in text for sym in ("┌", "├", "└", "×", "──"))
+            or any(t.lower() in text.lower() for t in FK_ALL_TYPES)
+        )
+    )
+    if chat_id in user_waiting_adjust or looks_like_meesho or looks_like_flipkart:
         user_waiting_adjust.discard(chat_id)
         handle_adjustment(bot, chat_id, msg_id, text)
         return
@@ -1331,8 +2005,6 @@ def process_single_message(bot, item):
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 local_in = os.path.join(tmp_dir, "input.pdf")
-                local_out_pdf = os.path.join(tmp_dir, "meesho_rearranged.pdf")
-                local_out_txt = os.path.join(tmp_dir, "meesho_picklist.txt")
 
                 file_info = bot.get_file(doc["file_id"])
                 if not file_info or not file_info.get("ok"):
@@ -1350,78 +2022,149 @@ def process_single_message(bot, item):
 
                 try:
                     t0 = time.time()
-                    res = process_initial_pdf(local_in, local_out_pdf, check_cancelled)
-                    if res[0] is None:
-                        return
-
-                    picklist_text, total_pages, multi_qty_count, known, anomalies = res
-                    duration = time.time() - t0
-
-                    if check_cancelled():
-                        return
-
-                    with open(local_out_txt, "w", encoding="utf-8") as f:
-                        f.write(picklist_text)
-
-                    # Save to persistent user cache for /adjust and courier commands
                     cache_dir = os.path.join(tempfile.gettempdir(), "meesho_bot_cache")
                     os.makedirs(cache_dir, exist_ok=True)
                     cached_pdf_path = os.path.join(cache_dir, f"batch_{chat_id}.pdf")
-                    shutil.copyfile(local_in, cached_pdf_path)
 
-                    user_last_batch[chat_id] = {
-                        "pdf_path": cached_pdf_path,
-                        "known": known,
-                        "anomalies": anomalies,
-                        "total_pages": total_pages,
-                        "factory_items": known,
-                        "tail_items": [],
-                        "last_courier": None,
-                        "timestamp": time.time()
-                    }
+                    if is_flipkart_pdf(local_in):
+                        local_out_pdf = os.path.join(tmp_dir, "rearranged_output.pdf")
+                        local_out_txt = os.path.join(tmp_dir, "picklist.txt")
 
-                    mode = user_modes.get(chat_id, "both")
-
-                    # 1. Send Picklist In Chat
-                    if len(picklist_text) <= 4000:
-                        bot.send_message(
-                            chat_id,
-                            f"📋 *Picklist Generated* ({total_pages} orders in {duration:.1f}s):\n\n```\n{picklist_text}\n```"
+                        fk_res = process_flipkart_pdf(
+                            local_in, local_out_pdf, check_cancelled, source_filename=file_name
                         )
-                    else:
-                        preview = picklist_text[:3800] + "\n... (full picklist in file below)"
-                        bot.send_message(chat_id, f"📋 *Picklist Preview*:\n\n```\n{preview}\n```")
+                        if fk_res is None or check_cancelled():
+                            return
 
-                    # 2. Send TXT File
-                    bot.send_document(chat_id, local_out_txt, caption=f"📄 Picklist: {total_pages} orders ({duration:.1f}s)")
+                        picklist_text = fk_res["picklist_text"]
+                        duration = time.time() - t0
+                        total_bags = fk_res["total_bags"]
+                        total_pcs = fk_res["grand_total_pieces"]
 
-                    # 3. Send Rearranged PDF (if both mode)
-                    if mode == "both":
-                        alert_note = f" | ⚠️ {multi_qty_count} multi-qty alert(s)" if multi_qty_count > 0 else ""
+                        with open(local_out_txt, "w", encoding="utf-8") as f:
+                            f.write(picklist_text)
+
+                        shutil.copyfile(local_in, cached_pdf_path)
+
+                        user_last_batch[chat_id] = {
+                            "platform": "flipkart",
+                            "pdf_path": cached_pdf_path,
+                            "singles": fk_res["singles"],
+                            "combos": fk_res["combos"],
+                            "anomalies": fk_res["anomalies"],
+                            "duplicates_skipped": fk_res["duplicates_skipped"],
+                            "factory_singles": fk_res["singles"],
+                            "tail_singles": [],
+                            "timestamp": time.time(),
+                        }
+
+                        mode = user_modes.get(chat_id, "both")
+
+                        send_picklist_messages(
+                            bot,
+                            chat_id,
+                            picklist_text,
+                            header_prefix=f"📋 *Flipkart Picklist* ({total_pcs} pcs / {total_bags} labels in {duration:.1f}s)"
+                        )
+
                         bot.send_document(
                             chat_id,
-                            local_out_pdf,
-                            caption=f"📑 Rearranged PDF: {total_pages} pages sorted{alert_note}"
+                            local_out_txt,
+                            caption=f"📄 Flipkart Picklist: {total_pcs} pcs / {total_bags} labels ({duration:.1f}s)"
                         )
 
-                    # 4. Courier Breakdown & Helpful Tips
-                    courier_counts = defaultdict(int)
-                    for it in known:
-                        cname = it[7] if len(it) > 7 else "Other"
-                        courier_counts[cname] += it[3]
+                        if mode == "both":
+                            n_singles = len(fk_res["singles"])
+                            n_combos = len(fk_res["combos"])
+                            n_dups = len(fk_res["duplicates_skipped"])
+                            parts_cap = [f"{total_bags} labels (3x5 cropped)"]
+                            if n_combos > 0:
+                                parts_cap.append(f"{n_singles} singles + {n_combos} combos at end")
+                            if n_dups > 0:
+                                parts_cap.append(f"{n_dups} duplicate(s) filtered")
+                            bot.send_document(
+                                chat_id,
+                                local_out_pdf,
+                                caption="📑 Flipkart Sorted PDF: " + " | ".join(parts_cap)
+                            )
 
-                    courier_summary = ", ".join(f"{c}: {cnt}" for c, cnt in sorted(courier_counts.items(), key=lambda x: -x[1]))
+                        bot.send_message(
+                            chat_id,
+                            "💡 *Quick Command:*\n• `/adjust` - Cut off at-home stock & move those labels to tail of PDF"
+                        )
+                    else:
+                        local_out_pdf = os.path.join(tmp_dir, "meesho_rearranged.pdf")
+                        local_out_txt = os.path.join(tmp_dir, "meesho_picklist.txt")
 
-                    tips = (
-                        f"🚚 *Couriers in batch:* {courier_summary}\n\n"
-                        "💡 *Quick Commands:*\n"
-                        "• `/ex` - Put Xpressbees orders on top\n"
-                        "• `/del` - Put Delhivery orders on top\n"
-                        "• `/sf` - Put Shadowfax orders on top\n"
-                        "• `/vl` - Put Valmo orders on top\n"
-                        "• `/adjust` - Move at-home stock to tail of PDF"
-                    )
-                    bot.send_message(chat_id, tips)
+                        res = process_initial_pdf(local_in, local_out_pdf, check_cancelled)
+                        if res[0] is None:
+                            return
+
+                        picklist_text, total_pages, multi_qty_count, known, anomalies = res
+                        duration = time.time() - t0
+
+                        if check_cancelled():
+                            return
+
+                        with open(local_out_txt, "w", encoding="utf-8") as f:
+                            f.write(picklist_text)
+
+                        shutil.copyfile(local_in, cached_pdf_path)
+
+                        user_last_batch[chat_id] = {
+                            "platform": "meesho",
+                            "pdf_path": cached_pdf_path,
+                            "known": known,
+                            "anomalies": anomalies,
+                            "total_pages": total_pages,
+                            "factory_items": known,
+                            "tail_items": [],
+                            "last_courier": None,
+                            "timestamp": time.time()
+                        }
+
+                        mode = user_modes.get(chat_id, "both")
+
+                        # 1. Send Picklist In Chat
+                        if len(picklist_text) <= 4000:
+                            bot.send_message(
+                                chat_id,
+                                f"📋 *Picklist Generated* ({total_pages} orders in {duration:.1f}s):\n\n```\n{picklist_text}\n```"
+                            )
+                        else:
+                            preview = picklist_text[:3800] + "\n... (full picklist in file below)"
+                            bot.send_message(chat_id, f"📋 *Picklist Preview*:\n\n```\n{preview}\n```")
+
+                        # 2. Send TXT File
+                        bot.send_document(chat_id, local_out_txt, caption=f"📄 Picklist: {total_pages} orders ({duration:.1f}s)")
+
+                        # 3. Send Rearranged PDF (if both mode)
+                        if mode == "both":
+                            alert_note = f" | ⚠️ {multi_qty_count} multi-qty alert(s)" if multi_qty_count > 0 else ""
+                            bot.send_document(
+                                chat_id,
+                                local_out_pdf,
+                                caption=f"📑 Rearranged PDF: {total_pages} pages sorted{alert_note}"
+                            )
+
+                        # 4. Courier Breakdown & Helpful Tips
+                        courier_counts = defaultdict(int)
+                        for it in known:
+                            cname = it[7] if len(it) > 7 else "Other"
+                            courier_counts[cname] += it[3]
+
+                        courier_summary = ", ".join(f"{c}: {cnt}" for c, cnt in sorted(courier_counts.items(), key=lambda x: -x[1]))
+
+                        tips = (
+                            f"🚚 *Couriers in batch:* {courier_summary}\n\n"
+                            "💡 *Quick Commands:*\n"
+                            "• `/ex` - Put Xpressbees orders on top\n"
+                            "• `/del` - Put Delhivery orders on top\n"
+                            "• `/sf` - Put Shadowfax orders on top\n"
+                            "• `/vl` - Put Valmo orders on top\n"
+                            "• `/adjust` - Move at-home stock to tail of PDF"
+                        )
+                        bot.send_message(chat_id, tips)
 
                 except Exception as e:
                     bot.send_message(chat_id, f"❌ Error processing PDF: {e}", reply_to_message_id=msg_id)
